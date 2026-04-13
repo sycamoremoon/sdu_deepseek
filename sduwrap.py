@@ -31,6 +31,7 @@ class ChatConfig:
         self.internet_search = 2
         self.model_name = "DeepSeek-V3.2-think"
         self.thinking_budget = 1000
+        self.tools = []
 
     def set_model(self, model_name: str):
         if model_name in MODEL_CONFIG:

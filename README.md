@@ -42,7 +42,9 @@ INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 
 - `GET /v1/models` - 获取模型列表
 - `GET /v1/models/{model_id}` - 获取模型信息
-- `POST /v1/chat/completions` - 聊天完成接口
+- `POST /v1/chat/completions` - 传统聊天完成接口
+- `POST /v1/responses` - Responses API 兼容入口，可供新版 Codex / Agent 客户端接入
+- `GET /v1/responses/{response_id}` - 获取已缓存的响应对象
 
 ## 支持的模型
 
@@ -54,6 +56,11 @@ INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 | `deepseek-ai/DeepSeek-V3.2-think` | DeepSeek V3.2 + 深度思考 |
 | `Qwen/Qwen3-235B-A22B-Instruct` | Qwen3 235B |
 | `Qwen/Qwen3-235B-A22B-Thinking` | Qwen3 235B + 深度思考 |
+| `gpt-5-codex` | Codex 兼容别名，实际映射到 DeepSeek-V3.2-think |
+| `gpt-5.1-codex` | Codex 兼容别名，实际映射到 DeepSeek-V3.2-think |
+| `gpt-5.2-codex` | Codex 兼容别名，实际映射到 DeepSeek-V3.2-think |
+| `gpt-5.3-codex` | Codex 兼容别名，实际映射到 DeepSeek-V3.2-think |
+| `codex-mini-latest` | Codex 兼容别名，实际映射到 DeepSeek-V3.2-think |
 
 ## 请求示例
 
@@ -77,6 +84,31 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   -d '{
     "model": "deepseek-ai/DeepSeek-V3.2",
     "messages": [{"role": "user", "content": "你好"}],
+    "stream": true
+  }'
+```
+
+### Responses API 请求
+
+```bash
+curl -X POST http://localhost:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.3-codex",
+    "instructions": "You are a coding assistant.",
+    "input": "请帮我分析这个项目的入口文件",
+    "stream": false
+  }'
+```
+
+### Responses API 流式请求
+
+```bash
+curl -N -X POST http://localhost:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.3-codex",
+    "input": "你好",
     "stream": true
   }'
 ```
@@ -109,6 +141,21 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }]
 }
 ```
+
+## Responses API 兼容说明
+
+- 代理层会把 `/v1/responses` 的 `input` / `instructions` / `previous_response_id` 映射为内部的 chat history，再转发给山大 DeepSeek 网页接口。
+- 已实现 Responses 风格的 SSE 事件序列；普通文本响应会输出 `response.output_text.*`，工具调用会输出 `response.function_call.arguments.*` 或 `response.custom_tool_call.input.*`。
+- 已支持内存态 `previous_response_id` 上下文续接；只在当前进程内有效，重启服务后会失效。
+- `reasoning.effort` 会被转换为内部 `thinking_budget`。
+- 若客户端请求的是 Codex 模型名，会被映射到 `DeepSeek-V3.2-think`。
+- 当请求中包含 `tools` 时，代理层会自动把工具定义注入系统提示，并把模型返回的结构化 `<tool_call>...</tool_call>` 文本重新映射为 Responses 的工具调用输出项。
+
+## 当前限制
+
+- 这是协议兼容层，不是真正的 Responses 原生后端。
+- 工具调用能力依赖提示工程和文本解析，不是网页后端原生返回 `tool_calls`；如果模型没有遵守 `<tool_call>` 输出格式，代理层会把结果当普通文本处理。
+- `previous_response_id` 的缓存目前保存在内存中，不会持久化到磁盘。
 
 ## 从源码运行
 
