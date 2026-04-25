@@ -214,6 +214,43 @@ def test_stream_tool_call_events(client, mock_sdu):
     assert '"name":"exec_command"' in text
 
 
+def test_stream_think_then_tool_call_events(client, mock_sdu):
+    mock_sdu(
+        [
+            {
+                "content": '<think>先检查目录，再执行命令。</think><exec_command>{"cmd":"pwd"}</exec_command>',
+                "reasoning_content": "",
+            }
+        ]
+    )
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V3.2-think",
+            "input": "need pwd",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                }
+            ],
+        },
+    ) as response:
+        text = response.read().decode("utf-8")
+    assert response.status_code == 200
+    assert "event: response.function_call_arguments.delta" in text
+    assert '"name":"exec_command"' in text
+    assert "<think>" not in text
+    assert "response.reasoning_summary_text.delta" not in text
+
+
 def test_stream_codex_named_xml_tool_call_events(client, mock_sdu):
     mock_sdu([{"content": '<update_plan>{"plan":[{"step":"创建文件","status":"in_progress"},{}]}</update_plan></tool_call>', "reasoning_content": ""}])
     with client.stream(

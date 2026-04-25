@@ -30,7 +30,7 @@ SDU_DEEPSEEK_SKIP_LOGIN=1 /home/damon/.local/venvs/tools/bin/pytest -q
 Result:
 
 ```text
-40 passed, 1 skipped in 0.63s
+44 passed, 1 skipped in 0.68s
 ```
 
 Coverage areas:
@@ -44,6 +44,8 @@ Coverage areas:
 | `function_call_output` conversion | Passed |
 | `previous_response_id` in-memory store | Passed |
 | Reasoning content response mapping | Passed |
+| Plain `<think>...</think>` parsing | Passed |
+| Split `<think>` chunk parsing | Passed |
 | Tool prompt injection | Passed |
 | Valid tool call parsing | Passed |
 | Codex-style named XML tool parsing | Passed |
@@ -61,6 +63,7 @@ Coverage areas:
 | Responses non-stream text route | Passed |
 | Responses SSE text stream | Passed |
 | Responses SSE function-call stream | Passed |
+| Think + tool-call stream regression | Passed |
 | `/responses` alias | Passed |
 | GET/DELETE/input_items routes | Passed |
 | `input_image` unsupported error | Passed |
@@ -89,10 +92,16 @@ RUN_LIVE_SDU_TESTS=1 SDU_DEEPSEEK_SKIP_LOGIN=1 /home/damon/.local/venvs/tools/bi
 Result:
 
 ```text
-1 passed in 8.25s
+3 passed in 39.07s
 ```
 
-The live test loads `cookies.json` into memory and sends one low-frequency text request to the existing `compose_chat` endpoint. No cookies or credentials are printed.
+The live tests load `cookies.json` into memory and send low-frequency text requests to the existing `compose_chat` endpoint. They cover:
+
+- Direct SDU text smoke through `sduwrap.chat`
+- Local `/v1/responses` smoke with `deepseek-ai/DeepSeek-V3.2-think`
+- Local `/v1/responses` smoke with `deepseek-ai/DeepSeek-V4`
+
+No cookies or credentials are printed.
 
 ## Codex End-To-End
 

@@ -7,7 +7,11 @@ cookies = {}
 
 url = "https://aiassist.sdu.edu.cn/site/ai/compose_chat"
 
+THINK_OPEN_TAGS = ("<think>", "<think\\>")
+THINK_CLOSE_TAGS = ("</think>", "</think\\>")
+
 MODEL_CONFIG = {
+    "DeepSeek-V4": {"compose_id": 73},
     "DeepSeek-V3.2-think": {"compose_id": 73},
     "DeepSeek-V3.2": {"compose_id": 73},
     "DeepSeek-R1": {"compose_id": 73},
@@ -89,6 +93,24 @@ class ChatStream:
         self.buffer = ""
         self.in_think = False
 
+    @staticmethod
+    def _find_first_tag(buffer, tags):
+        found = [(buffer.find(tag), tag) for tag in tags if buffer.find(tag) != -1]
+        if not found:
+            return -1, None
+        return min(found, key=lambda item: item[0])
+
+    @staticmethod
+    def _safe_flush_pos(buffer, tags):
+        longest_partial = 0
+        max_partial = max((len(tag) for tag in tags), default=0) - 1
+        max_partial = min(len(buffer), max_partial)
+        for partial_len in range(1, max_partial + 1):
+            suffix = buffer[-partial_len:]
+            if any(tag.startswith(suffix) for tag in tags):
+                longest_partial = partial_len
+        return len(buffer) - longest_partial
+
     def process(self, chunk):
         self.buffer += chunk
         reasoning_content = ""
@@ -96,35 +118,25 @@ class ChatStream:
         
         while True:
             if not self.in_think:
-                think_start = self.buffer.find('<think\\>')
-                if think_start != -1:
+                think_start, think_tag = self._find_first_tag(self.buffer, THINK_OPEN_TAGS)
+                if think_start != -1 and think_tag is not None:
                     content += self.buffer[:think_start]
-                    self.buffer = self.buffer[think_start + 8:]
+                    self.buffer = self.buffer[think_start + len(think_tag):]
                     self.in_think = True
                 else:
-                    safe_pos = len(self.buffer)
-                    for i in range(len(self.buffer)):
-                        if self.buffer[i] == '<' and i + 7 <= len(self.buffer):
-                            if self.buffer[i:i+7] == '<think\\>':
-                                safe_pos = i
-                                break
+                    safe_pos = self._safe_flush_pos(self.buffer, THINK_OPEN_TAGS)
                     if safe_pos > 0:
                         content += self.buffer[:safe_pos]
                         self.buffer = self.buffer[safe_pos:]
                     break
             else:
-                think_end = self.buffer.find('</think\\>')
-                if think_end != -1:
+                think_end, think_tag = self._find_first_tag(self.buffer, THINK_CLOSE_TAGS)
+                if think_end != -1 and think_tag is not None:
                     reasoning_content += self.buffer[:think_end]
-                    self.buffer = self.buffer[think_end + 9:]
+                    self.buffer = self.buffer[think_end + len(think_tag):]
                     self.in_think = False
                 else:
-                    safe_pos = len(self.buffer)
-                    for i in range(len(self.buffer)):
-                        if self.buffer[i] == '<' and i + 9 <= len(self.buffer):
-                            if self.buffer[i:i+9] == '</think\\>':
-                                safe_pos = i
-                                break
+                    safe_pos = self._safe_flush_pos(self.buffer, THINK_CLOSE_TAGS)
                     if safe_pos > 0:
                         reasoning_content += self.buffer[:safe_pos]
                         self.buffer = self.buffer[safe_pos:]

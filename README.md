@@ -53,6 +53,7 @@ INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 
 | 模型 ID | 说明 |
 |---------|------|
+| `deepseek-ai/DeepSeek-V4` | DeepSeek V4 |
 | `deepseek-ai/DeepSeek-V3.2` | DeepSeek V3.2 |
 | `deepseek-ai/DeepSeek-R1` | DeepSeek R1 (深度思考) |
 | `deepseek-ai/DeepSeek-V3` | DeepSeek V3 |
@@ -104,6 +105,8 @@ curl -X POST http://localhost:8000/v1/responses \
 示例配置见 `docs/codex_provider_setup.md`。本地服务接受任意 dummy API key；SDU 登录仍使用现有 `cookies.json` / `credentials.json` / 登录流程。
 
 当前 Responses 兼容层支持普通文本、Responses 语义 SSE、内存 `previous_response_id`、reasoning best-effort 映射、function tool 协议桥接。SDU 已验证网页端是文本 form-data 流，未发现原生图片/文件/工具调用接口，因此多模态输入会返回明确的 unsupported 错误。
+
+对于带深度思考的模型，代理会尽量把 `<think>...</think>` 从正文中剥离为 `reasoning` / `reasoning_content`，避免把思维过程误当成普通回答或工具调用正文。Responses 流默认不向 Codex 前台推送 reasoning delta；最终响应对象中仍保留 `reasoning` 字段，必要时可通过设置环境变量 `SDU_DEEPSEEK_STREAM_REASONING=1` 重新开启流式 reasoning 事件。
 
 ## 特殊参数
 

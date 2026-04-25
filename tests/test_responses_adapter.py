@@ -1,6 +1,6 @@
 import pytest
 
-from responses_adapter import build_output_items, prepare_responses_request
+from responses_adapter import build_output_items, normalize_sdu_output, prepare_responses_request
 from responses_models import ResponsesRequest, UnsupportedInputError
 from responses_store import ResponseStore
 
@@ -121,3 +121,12 @@ def test_reasoning_and_tool_call_output_mapping():
     )
     assert not errors
     assert output[0]["type"] == "function_call"
+
+
+def test_normalize_sdu_output_extracts_think_block():
+    content, reasoning = normalize_sdu_output(
+        '<think>先思考</think><exec_command>{"cmd":"pwd"}</exec_command>',
+        "",
+    )
+    assert content == '<exec_command>{"cmd":"pwd"}</exec_command>'
+    assert reasoning == "先思考"
