@@ -228,3 +228,43 @@ def test_parse_function_tool_call_with_top_level_arguments():
     item = result.calls[0].to_response_item()
     assert item["name"] == "exec_command"
     assert item["arguments"] == '{"cmd":"python3 /tmp/demo.py --help","workdir":"/tmp/demo"}'
+
+
+def test_parse_code_fenced_json_tool_call():
+    result = parse_tool_calls('```json\n{"name":"exec_command","arguments":{"cmd":"pwd"}}\n```', TOOLS)
+    assert not result.errors
+    item = result.calls[0].to_response_item()
+    assert item["type"] == "function_call"
+    assert item["name"] == "exec_command"
+    assert item["arguments"] == '{"cmd":"pwd"}'
+
+
+def test_parse_apply_patch_falls_back_to_declared_exec_command_when_custom_tool_missing():
+    text = """我来创建一个Python文件整理程序。
+
+<tool_call>
+<apply_patch>
+*** Begin Patch
+*** Add File: file_organizer.py
++print("hi")
+*** End Patch
+</apply_patch>
+</tool_call>"""
+    result = parse_tool_calls(text, TOOLS)
+    assert not result.errors
+    item = result.calls[0].to_response_item()
+    assert item["type"] == "function_call"
+    assert item["name"] == "exec_command"
+    arguments = item["arguments"]
+    assert "apply_patch <<'PATCH'" in arguments
+    assert "Add File: file_organizer.py" in arguments
+    assert "<tool_call>" not in result.stripped_text
+    assert "<apply_patch>" not in result.stripped_text
+
+
+def test_invalid_tool_markup_is_stripped_from_fallback_text():
+    result = parse_tool_calls("<tool_call>{bad json}</tool_call>", TOOLS)
+    assert result.calls == []
+    assert result.errors
+    assert result.had_tool_markup is True
+    assert "<tool_call>" not in result.stripped_text

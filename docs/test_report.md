@@ -6,15 +6,16 @@ Date: 2026-04-25
 
 | Item | Value |
 | --- | --- |
-| Working directory | `/home/damon/SDU_DeepSeek` |
-| Python venv | `/home/damon/.local/venvs/tools` |
-| Python | `3.14.4` |
-| Codex CLI | `codex-cli 0.125.0-alpha.3` |
+| Working directory | `/Volumes/Hacking/SDU_DeepSeek` |
+| Python venv | temporary `.codex-venv` |
+| Python | `3.14` |
+| Codex CLI | `codex-cli 0.120.0` locally; user reproduction used `0.123.0` |
 
-Dependencies installed:
+Dependencies installed in a temporary local venv, then removed after testing:
 
 ```bash
-/home/damon/.local/venvs/tools/bin/pip install -r requirements.txt pytest httpx openai
+python3 -m venv .codex-venv
+.codex-venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 ```
 
 `requirements-dev.txt` was added for repeatable test dependency installs.
@@ -24,13 +25,13 @@ Dependencies installed:
 Command:
 
 ```bash
-SDU_DEEPSEEK_SKIP_LOGIN=1 /home/damon/.local/venvs/tools/bin/pytest -q
+SDU_DEEPSEEK_SKIP_LOGIN=1 .codex-venv/bin/pytest -q
 ```
 
 Result:
 
 ```text
-46 passed, 3 skipped in 0.69s
+62 passed, 3 skipped in 0.82s
 ```
 
 Coverage areas:
@@ -49,6 +50,7 @@ Coverage areas:
 | Tool prompt injection | Passed |
 | Custom-tool XML prompt guidance | Passed |
 | Valid tool call parsing | Passed |
+| Fenced JSON tool call parsing | Passed |
 | Codex-style named XML tool parsing | Passed |
 | Codex-style named XML tool streaming | Passed |
 | `update_plan` empty-item repair | Passed |
@@ -57,13 +59,16 @@ Coverage areas:
 | Nested XML argument tool parsing | Passed |
 | Self-closing XML attribute tool parsing | Passed |
 | Previous tool-record replay recovery | Passed |
+| Invalid tool markup stripping | Passed |
 | Invalid JSON tool call handling | Passed |
 | Unknown tool name handling | Passed |
 | Schema mismatch handling | Passed |
 | Custom/freeform tool parsing | Passed |
+| Think-model apply_patch custom-tool streaming buffer | Passed |
+| Think-model apply_patch fallback to declared `exec_command` | Passed |
 | Unclosed custom-tool wrapper recovery | Passed |
 | Top-level function argument recovery | Passed |
-| Responses non-stream text route | Passed |
+| Responses non-stream text route for V3.2, V3.2-think, V4 | Passed |
 | Responses SSE text stream | Passed |
 | Responses SSE function-call stream | Passed |
 | `/responses` alias | Passed |
@@ -78,7 +83,7 @@ Coverage areas:
 Syntax check:
 
 ```bash
-/home/damon/.local/venvs/tools/bin/python -m py_compile main.py responses_models.py responses_adapter.py responses_store.py tool_bridge.py streaming.py scripts/capture_codex_requests.py scripts/probe_sdu_capabilities.py examples/test_openai_responses_client.py
+.codex-venv/bin/python -m py_compile main.py responses_models.py responses_adapter.py responses_store.py tool_bridge.py streaming.py scripts/capture_codex_requests.py scripts/probe_sdu_capabilities.py examples/test_openai_responses_client.py
 ```
 
 Result: passed.
@@ -88,13 +93,13 @@ Result: passed.
 Command:
 
 ```bash
-RUN_LIVE_SDU_TESTS=1 SDU_DEEPSEEK_SKIP_LOGIN=1 /home/damon/.local/venvs/tools/bin/pytest -q tests/test_live_sdu.py
+RUN_LIVE_SDU_TESTS=1 SDU_DEEPSEEK_SKIP_LOGIN=1 .codex-venv/bin/pytest -q tests/test_live_sdu.py
 ```
 
 Result:
 
 ```text
-3 passed in 25.23s
+Not rerun in this pass. The focused end-to-end checks below exercised the live SDU backend through local `/v1/responses` using the existing `cookies.json`.
 ```
 
 The live tests load `cookies.json` into memory and send low-frequency text requests to the existing `compose_chat` endpoint. No cookies or credentials are printed.
@@ -104,63 +109,61 @@ The live tests load `cookies.json` into memory and send low-frequency text reque
 Server command:
 
 ```bash
-/home/damon/.local/venvs/tools/bin/uvicorn main:app --host 127.0.0.1 --port 18081
+.codex-venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 18083
 ```
 
-Simple Responses provider run:
+Current focused run used local Codex `0.120.0`, so it is a compatibility smoke rather than an exact reproduction of the user's `0.123.0` environment. The server loaded the existing `cookies.json`; no cookie values or credentials were printed.
+
+Think-model apply_patch run:
 
 ```bash
-env SDU_DEEPSEEK_API_KEY=dummy CODEX_HOME=/tmp/codex-sdu-real-home codex exec \
-  --ignore-user-config --ephemeral --skip-git-repo-check --sandbox read-only \
-  -c 'model_providers.sdu_deepseek={name="SDU DeepSeek Local", base_url="http://127.0.0.1:18081/v1", env_key="SDU_DEEPSEEK_API_KEY", wire_api="responses", stream_idle_timeout_ms=300000}' \
+env SDU_DEEPSEEK_API_KEY=dummy CODEX_HOME=/tmp/codex-sdu-e2e-home codex exec \
+  --ephemeral --skip-git-repo-check --enable apply_patch_freeform --sandbox workspace-write \
+  -C /tmp/sdu-codex-think-... \
+  -c 'model_providers.sdu_deepseek={name="SDU DeepSeek Local", base_url="http://127.0.0.1:18083/v1", env_key="SDU_DEEPSEEK_API_KEY", wire_api="responses", stream_idle_timeout_ms=300000}' \
   -c model_provider="sdu_deepseek" \
-  -m deepseek-ai/DeepSeek-V3.2 \
-  "请只回答：SDU Codex OK"
+  -m deepseek-ai/DeepSeek-V3.2-think \
+  '请创建 file_organizer.py，只写一行 print("organizer ok")...'
 ```
 
-Result: Codex printed `SDU Codex OK`.
+Result: Codex executed `apply_patch`, created `file_organizer.py`, then executed `cat file_organizer.py`. Final file content:
 
-Tool bridge run:
+```python
+print("organizer ok")
+```
+
+V3.2 and V4 function-tool smoke:
 
 ```bash
-env SDU_DEEPSEEK_API_KEY=dummy CODEX_HOME=/tmp/codex-sdu-real-home codex exec \
-  --ignore-user-config --ephemeral --skip-git-repo-check --sandbox read-only \
-  -c 'model_providers.sdu_deepseek={name="SDU DeepSeek Local", base_url="http://127.0.0.1:18081/v1", env_key="SDU_DEEPSEEK_API_KEY", wire_api="responses", stream_idle_timeout_ms=300000}' \
-  -c model_provider="sdu_deepseek" \
-  -m deepseek-ai/DeepSeek-V3.2 \
-  '请必须调用 exec_command 工具运行 pwd。工具调用格式必须严格输出：<tool_call>{"name":"exec_command","arguments":{"cmd":"pwd"}}</tool_call>。拿到工具结果后，用一句话回答当前目录。'
+for model in deepseek-ai/DeepSeek-V3.2 deepseek-ai/DeepSeek-V4; do
+  env SDU_DEEPSEEK_API_KEY=dummy CODEX_HOME=/tmp/codex-sdu-e2e-home codex exec \
+    --ephemeral --skip-git-repo-check --sandbox read-only \
+    -C /tmp/sdu-codex-${model##*/}-... \
+    -c 'model_providers.sdu_deepseek={name="SDU DeepSeek Local", base_url="http://127.0.0.1:18083/v1", env_key="SDU_DEEPSEEK_API_KEY", wire_api="responses", stream_idle_timeout_ms=300000}' \
+    -c model_provider="sdu_deepseek" \
+    -m "$model" \
+    '请必须调用 exec_command 工具运行 pwd...'
+done
 ```
 
 Result:
 
 ```text
-exec: /usr/sbin/bash -lc pwd
-Output: /home/damon/SDU_DeepSeek
-Codex final answer: 当前目录是 `/home/damon/SDU_DeepSeek`。
+deepseek-ai/DeepSeek-V3.2: Codex executed exec_command pwd and returned the temp working directory.
+deepseek-ai/DeepSeek-V4: Codex executed exec_command pwd and returned the temp working directory.
 ```
 
-This verifies the full loop: Codex -> local `/v1/responses` -> SDU text backend -> local function_call item -> Codex tool execution -> `function_call_output` -> SDU final answer.
+No raw `<tool_call>`, `<apply_patch>`, or `<think>` markup appeared as the final assistant answer in these runs.
 
-File creation/read regression:
+Older baseline runs from the previous report also validated simple text, V3.2 `exec_command`, and V3.2 file creation/read loops; those commands used a Linux venv path and are superseded by the focused run above for this branch.
 
-```bash
-/home/damon/.local/venvs/tools/bin/uvicorn main:app --host 127.0.0.1 --port 18082
-env SDU_DEEPSEEK_API_KEY=dummy CODEX_HOME=/tmp/codex-sdu-real-home codex exec \
-  --ignore-user-config --ephemeral --skip-git-repo-check --sandbox workspace-write \
-  -c 'model_providers.sdu_deepseek={name="SDU DeepSeek Local", base_url="http://127.0.0.1:18082/v1", env_key="SDU_DEEPSEEK_API_KEY", wire_api="responses", stream_idle_timeout_ms=300000}' \
-  -c model_provider="sdu_deepseek" \
-  -m deepseek-ai/DeepSeek-V3.2 \
-  "请在当前目录创建 hello.py，内容打印 Hello from SDU Codex，然后读取它并告诉我结果。"
+Observed Codex warning remains for these custom model ids:
+
+```text
+Unknown model deepseek-ai/DeepSeek-V3.2-think is used. This will use fallback model metadata.
 ```
 
-Result: Codex created `hello.py`, ran `cat hello.py`, and produced a final answer showing:
-
-```python
-#!/usr/bin/env python3
-print('Hello from SDU Codex')
-```
-
-This specifically validates the regression that previously exposed raw `<update_plan>` / XML-like tool markup to the CLI. The current bridge parses those variants into Responses tool items instead of leaking them as assistant text.
+The warning is emitted by Codex's internal model metadata table before or independently of `/v1/models`; it did not prevent the local Responses tool loop from working.
 
 ## Known Limitations And Risks
 
@@ -171,5 +174,6 @@ This specifically validates the regression that previously exposed raw `<update_
 | Store durability | `previous_response_id` state is in-memory and lost on restart. |
 | Token usage | Usage fields are character-based estimates, not tokenizer-accurate counts. |
 | SDU web changes | If `compose_chat` request fields or stream format change, the proxy may need updates. |
-| Custom tools | `custom_tool_call` is best-effort for grammar/freeform tools like `apply_patch`; Codex default path primarily uses function tools. |
+| Custom tools | `custom_tool_call` is supported for grammar/freeform tools like `apply_patch`; if Codex does not declare `apply_patch` but does declare a shell-like function tool, patch markup can be converted to an `exec_command`/`shell` call that runs `apply_patch` locally in Codex. |
 | Reasoning | Reasoning is parsed from SDU text markers and mapped best-effort; no native encrypted reasoning support is claimed. |
+| Streaming tool calls | When tools are present, streaming buffers the model text until the call can be classified, avoiding raw `<tool_call>` / `<think>` leakage as `response.output_text.delta`. |

@@ -265,6 +265,40 @@ def should_stream_reasoning_events(request: ResponsesRequest) -> bool:
     return False
 
 
+def debug_compat_event(stage: str, request: ResponsesRequest, output: list[dict], reasoning: str, tool_errors: list[str]):
+    if os.environ.get("SDU_DEEPSEEK_DEBUG") != "1":
+        return
+    items = []
+    for item in output:
+        summary = {"type": item.get("type"), "name": item.get("name")}
+        arguments = item.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                summary["argument_keys"] = sorted(parsed.keys())
+        if item.get("type") == "custom_tool_call":
+            summary["has_input"] = bool(item.get("input"))
+        items.append(summary)
+    print(
+        "[ResponsesCompat]",
+        json.dumps(
+            {
+                "stage": stage,
+                "model": request.model,
+                "stream": bool(request.stream),
+                "has_reasoning": bool(reasoning),
+                "output_items": items,
+                "tool_error_count": len(tool_errors),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
 def response_not_found(response_id: str) -> JSONResponse:
     return JSONResponse(
         status_code=404,
@@ -347,6 +381,7 @@ async def openai_responses(request: ResponsesRequest):
         return JSONResponse(status_code=502, content=response)
 
     output, tool_errors = build_output_items(full_content, full_reasoning, request)
+    debug_compat_event("non_stream_output", request, output, full_reasoning, tool_errors)
     response = build_response_object(
         request,
         response_id=response_id,
@@ -454,6 +489,7 @@ async def generate_responses_stream(
 
     if buffer_for_tools:
         output, tool_errors = build_output_items(content, reasoning, request)
+        debug_compat_event("stream_buffered_output", request, output, reasoning, tool_errors)
         for output_index, item in enumerate(output):
             if item.get("type") in {"function_call", "custom_tool_call"}:
                 for event in tool_call_events(item, output_index):
@@ -469,6 +505,7 @@ async def generate_responses_stream(
     else:
         output = [stream_item] if stream_item is not None else [message_output_item(content)]
         tool_errors = []
+        debug_compat_event("stream_text_output", request, output, reasoning, tool_errors)
         if stream_item is not None:
             for event in message_done_events(stream_item):
                 yield event

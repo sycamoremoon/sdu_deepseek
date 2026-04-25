@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 
 def test_responses_non_stream_text(client, mock_sdu):
     mock_sdu([{"content": "你好", "reasoning_content": ""}])
@@ -12,6 +14,26 @@ def test_responses_non_stream_text(client, mock_sdu):
     assert body["object"] == "response"
     assert body["output_text"] == "你好"
     assert body["output"][0]["content"][0]["type"] == "output_text"
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "deepseek-ai/DeepSeek-V3.2",
+        "deepseek-ai/DeepSeek-V3.2-think",
+        "deepseek-ai/DeepSeek-V4",
+    ],
+)
+def test_responses_non_stream_text_for_supported_deepseek_models(client, mock_sdu, model):
+    mock_sdu([{"content": f"answer for {model}", "reasoning_content": ""}])
+    response = client.post(
+        "/v1/responses",
+        json={"model": model, "input": "ping", "stream": False},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model"] == model
+    assert body["output_text"] == f"answer for {model}"
 
 
 def test_responses_stream_text(client, mock_sdu):
@@ -38,6 +60,30 @@ def test_reasoning_mapping_non_stream(client, mock_sdu):
     body = response.json()
     assert body["reasoning"]["summary"][0]["text"] == "reason"
     assert body["usage"]["output_tokens_details"]["reasoning_tokens"] >= 1
+
+
+def test_reasoning_content_does_not_pollute_output_text(client, mock_sdu):
+    mock_sdu([{"content": "最终回答", "reasoning_content": "这里是思考"}])
+    response = client.post(
+        "/v1/responses",
+        json={"model": "deepseek-ai/DeepSeek-V3.2-think", "input": "ping"},
+    )
+    body = response.json()
+    assert body["output_text"] == "最终回答"
+    assert "这里是思考" not in body["output_text"]
+    assert body["reasoning"]["summary"][0]["text"] == "这里是思考"
+
+
+def test_think_tags_do_not_pollute_output_text(client, mock_sdu):
+    mock_sdu([{"content": "<think>这里是思考过程</think>\n最终回答", "reasoning_content": ""}])
+    response = client.post(
+        "/v1/responses",
+        json={"model": "deepseek-ai/DeepSeek-V3.2-think", "input": "ping"},
+    )
+    body = response.json()
+    assert body["output_text"].strip() == "最终回答"
+    assert "<think>" not in body["output_text"]
+    assert "这里是思考过程" not in body["output_text"]
 
 
 def test_tool_call_response(client, mock_sdu):
@@ -277,6 +323,54 @@ def test_custom_tool_call_response_with_old_codex_function_like_apply_patch(clie
     assert "New File: file_organizer.py" in body["output"][0]["input"]
 
 
+def test_think_apply_patch_without_custom_tool_falls_back_to_exec_command(client, mock_sdu):
+    mock_sdu(
+        [
+            {
+                "content": (
+                    "我来创建一个Python文件整理程序。\n\n"
+                    "<think>我需要修改文件</think>\n"
+                    "<tool_call>\n<apply_patch>\n"
+                    "*** Begin Patch\n"
+                    "*** Add File: file_organizer.py\n"
+                    '+print("hi")\n'
+                    "*** End Patch\n"
+                    "</apply_patch>\n</tool_call>"
+                ),
+                "reasoning_content": "",
+            }
+        ]
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V3.2-think",
+            "input": "write file",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                }
+            ],
+        },
+    )
+    body = response.json()
+    assert response.status_code == 200
+    assert body["output_text"] == ""
+    assert body["output"][0]["type"] == "function_call"
+    assert body["output"][0]["name"] == "exec_command"
+    arguments = json.loads(body["output"][0]["arguments"])
+    assert "apply_patch <<'PATCH'" in arguments["cmd"]
+    assert "Add File: file_organizer.py" in arguments["cmd"]
+    assert "<tool_call>" not in body["output_text"]
+    assert "<apply_patch>" not in body["output_text"]
+
+
 def test_function_tool_response_with_top_level_arguments(client, mock_sdu):
     mock_sdu(
         [
@@ -488,6 +582,42 @@ def test_stream_self_closing_xml_attribute_tool_events(client, mock_sdu):
         text = response.read().decode("utf-8")
     assert "event: response.function_call_arguments.delta" in text
     assert '"arguments":"{\\"cmd\\":\\"cat hello.py\\"}"' in text
+
+
+def test_stream_think_apply_patch_custom_tool_is_buffered_and_not_leaked(client, mock_sdu):
+    mock_sdu(
+        [
+            {"content": "<think>我需要修改", "reasoning_content": ""},
+            {"content": "文件</think>\n我来创建文件。\n<tool_call>\n<apply_patch>\n*** Begin Patch\n", "reasoning_content": ""},
+            {"content": "*** Add File: file_organizer.py\n+print(\"hi\")\n*** End Patch\n</apply_patch>\n</tool_call>", "reasoning_content": ""},
+        ]
+    )
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V3.2-think",
+            "input": "write file",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool.",
+                    "format": {"type": "grammar"},
+                }
+            ],
+        },
+    ) as response:
+        text = response.read().decode("utf-8")
+    assert response.status_code == 200
+    assert "event: response.custom_tool_call_input.delta" in text
+    assert "event: response.completed" in text
+    assert '"name":"apply_patch"' in text
+    assert "<tool_call>" not in text
+    assert "<apply_patch>" not in text
+    assert "<think>" not in text
+    assert "response.output_text.delta" not in text
 
 
 def test_stream_events_are_json(client, mock_sdu):

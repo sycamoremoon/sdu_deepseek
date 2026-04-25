@@ -349,6 +349,8 @@ def build_output_items(content: str, reasoning_text: str, request: ResponsesRequ
         errors = parse_result.errors
         if parse_result.stripped_text:
             message_text = parse_result.stripped_text
+        elif parse_result.had_tool_markup and parse_result.errors:
+            message_text = "The model returned a tool call that could not be converted safely."
     return [message_output_item(message_text)], errors
 
 

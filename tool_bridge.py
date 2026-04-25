@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from typing import Any
 
 
-TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 TOOL_CALL_TAG_RE = re.compile(r"</?tool_call>", re.IGNORECASE)
 TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>\s*", re.IGNORECASE)
+CODE_FENCE_RE = re.compile(r"```(?:json|tool_call)?\s*(?P<body>\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 TOOL_RECORD_RE = re.compile(
     r"(?:^|\n)\s*Tool call requested:\s*(?P<name>[A-Za-z_][\w.-]*)\s+"
     r"(?:call_id=\S+\s+)?arguments=(?P<arguments>\{.*?\})\s*(?=$|\n)",
@@ -77,6 +78,7 @@ class ToolParseResult:
     calls: list[ParsedToolCall]
     errors: list[str]
     stripped_text: str
+    had_tool_markup: bool = False
 
 
 @dataclass
@@ -164,11 +166,12 @@ def parse_tool_calls(text: str, raw_tools: list[Any] | None, parallel_tool_calls
     specs_by_name = {spec.name: spec for spec in specs}
     candidates = _extract_tool_call_candidates(text or "", specs_by_name)
     if not candidates:
-        return ToolParseResult(calls=[], errors=[], stripped_text=text)
+        return ToolParseResult(calls=[], errors=[], stripped_text=text, had_tool_markup=False)
 
     calls: list[ParsedToolCall] = []
     errors: list[str] = []
     consumed_spans: list[tuple[int, int]] = []
+    candidate_spans = [candidate.span for candidate in candidates]
     for candidate in candidates:
         parsed = _parse_candidate(candidate, specs_by_name)
         if parsed[1]:
@@ -189,8 +192,9 @@ def parse_tool_calls(text: str, raw_tools: list[Any] | None, parallel_tool_calls
         if calls and not parallel_tool_calls:
             break
 
-    stripped_text = _strip_consumed_tool_markup(text or "", consumed_spans)
-    return ToolParseResult(calls=calls, errors=errors, stripped_text=stripped_text)
+    stripped_spans = consumed_spans if calls else candidate_spans
+    stripped_text = _strip_consumed_tool_markup(text or "", stripped_spans)
+    return ToolParseResult(calls=calls, errors=errors, stripped_text=stripped_text, had_tool_markup=True)
 
 
 def _extract_tool_call_candidates(text: str, specs_by_name: dict[str, ToolSpec]) -> list[_ToolCallCandidate]:
@@ -206,6 +210,12 @@ def _extract_tool_call_candidates(text: str, specs_by_name: dict[str, ToolSpec])
         if "</tool_call>" in text[match.end():]:
             continue
         candidates.append(_ToolCallCandidate(source="open_tool_call", span=span, payload=text[match.end():].strip()))
+    for match in CODE_FENCE_RE.finditer(text):
+        candidates.append(_ToolCallCandidate(source="code_fence", span=match.span(), payload=match.group("body").strip()))
+
+    stripped = text.strip()
+    if stripped.startswith("{") and '"name"' in stripped:
+        candidates.append(_ToolCallCandidate(source="json_object", span=(0, len(text)), payload=stripped))
 
     if not specs_by_name:
         return candidates
@@ -302,6 +312,9 @@ def _parse_candidate(
         nested = _parse_wrapped_named_xml(candidate.payload, specs_by_name)
         if nested:
             return nested, None
+        apply_patch_shell = _parse_apply_patch_shell_fallback(candidate.payload, specs_by_name)
+        if apply_patch_shell:
+            return apply_patch_shell, None
         loose = _parse_loose_tool_object(candidate.payload, specs_by_name)
         if loose:
             return loose, None
@@ -317,6 +330,53 @@ def _parse_candidate(
     if normalize_error:
         return None, normalize_error
     return (name, normalized), None
+
+
+def _parse_apply_patch_shell_fallback(
+    payload: str,
+    specs_by_name: dict[str, ToolSpec],
+) -> tuple[str, dict[str, Any]] | None:
+    if "apply_patch" in specs_by_name:
+        return None
+    shell_spec = _select_shell_like_tool(specs_by_name)
+    if shell_spec is None:
+        return None
+
+    match = re.search(r"<apply_patch>\s*(?P<body>.*?)\s*</apply_patch>", payload, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return None
+    patch = _strip_code_fence(match.group("body").strip())
+    if not patch.startswith("*** Begin Patch") or "*** End Patch" not in patch:
+        return None
+
+    command_key = _shell_command_key(shell_spec)
+    command = _apply_patch_command(patch)
+    return shell_spec.name, {"arguments": {command_key: command}}
+
+
+def _select_shell_like_tool(specs_by_name: dict[str, ToolSpec]) -> ToolSpec | None:
+    for name in ("exec_command", "shell", "local_shell"):
+        spec = specs_by_name.get(name)
+        if spec and spec.type != "custom":
+            return spec
+    return None
+
+
+def _shell_command_key(spec: ToolSpec) -> str:
+    properties = spec.parameters.get("properties", {}) if isinstance(spec.parameters, dict) else {}
+    if isinstance(properties, dict):
+        if "cmd" in properties:
+            return "cmd"
+        if "command" in properties:
+            return "command"
+    return "cmd"
+
+
+def _apply_patch_command(patch: str) -> str:
+    delimiter = "PATCH"
+    while delimiter in patch:
+        delimiter += "_EOF"
+    return f"apply_patch <<'{delimiter}'\n{patch}\n{delimiter}"
 
 
 def _parse_wrapped_named_xml(
