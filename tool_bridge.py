@@ -12,6 +12,7 @@ TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.
 TOOL_CALL_TAG_RE = re.compile(r"</?tool_call>", re.IGNORECASE)
 TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>\s*", re.IGNORECASE)
 CODE_FENCE_RE = re.compile(r"```(?:json|tool_call)?\s*(?P<body>\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+APPLY_PATCH_RE = re.compile(r"<apply_patch>\s*(?P<body>.*?)\s*</apply_patch>", re.DOTALL | re.IGNORECASE)
 TOOL_RECORD_RE = re.compile(
     r"(?:^|\n)\s*Tool call requested:\s*(?P<name>[A-Za-z_][\w.-]*)\s+"
     r"(?:call_id=\S+\s+)?arguments=(?P<arguments>\{.*?\})\s*(?=$|\n)",
@@ -133,7 +134,13 @@ def build_tool_prompt(tools: list[Any] | None, parallel_tool_calls: bool | None)
         return ""
 
     serializable = []
+    has_custom_tool = False
+    first_custom_tool_name = "custom_tool_name"
     for spec in specs:
+        if spec.type == "custom":
+            has_custom_tool = True
+            if first_custom_tool_name == "custom_tool_name":
+                first_custom_tool_name = spec.name
         serializable.append(
             {
                 "name": spec.name,
@@ -144,21 +151,28 @@ def build_tool_prompt(tools: list[Any] | None, parallel_tool_calls: bool | None)
         )
 
     limit_text = "You may output multiple <tool_call> blocks." if parallel_tool_calls else "Output at most one <tool_call> block."
-    return (
+    parts = [
         "Tool calling compatibility instructions:\n"
         "The backend does not provide native tool execution. If a tool is needed, respond only with strict tool call markup:\n"
         '<tool_call>{"name":"tool_name","arguments":{...}}</tool_call>\n'
         "Codex-style named XML is also accepted when you cannot produce the JSON wrapper:\n"
         '<tool_name>{"arg":"value"}</tool_name>\n'
-        "For custom/freeform tools, prefer named XML so the body is not JSON-escaped, for example:\n"
-        "<apply_patch>\n*** Begin Patch\n...\n*** End Patch\n</apply_patch>\n"
-        "If you must use the JSON wrapper for a custom/freeform tool, use a string field named input.\n"
+    ]
+    if has_custom_tool:
+        parts.append(
+            "For declared custom/freeform tools, prefer named XML so the body is not JSON-escaped, for example:\n"
+            f"<{first_custom_tool_name}>\nfreeform input\n</{first_custom_tool_name}>\n"
+            "If you must use the JSON wrapper for a custom/freeform tool, use a string field named input.\n"
+        )
+    parts.append(
         f"{limit_text}\n"
         "When calling a tool, output only the tool call and stop. Do not wrap it in Markdown or explanatory prose.\n"
-        "Use only tool names declared below. If no tool is needed, answer normally.\n"
+        "Use only tool names declared below. Do not output apply_patch unless apply_patch is declared below. "
+        "If no tool is needed, answer normally.\n"
         "Declared tools:\n"
         f"{json.dumps(serializable, ensure_ascii=False, indent=2)}"
     )
+    return "".join(parts)
 
 
 def parse_tool_calls(text: str, raw_tools: list[Any] | None, parallel_tool_calls: bool | None = False) -> ToolParseResult:
@@ -212,6 +226,17 @@ def _extract_tool_call_candidates(text: str, specs_by_name: dict[str, ToolSpec])
         candidates.append(_ToolCallCandidate(source="open_tool_call", span=span, payload=text[match.end():].strip()))
     for match in CODE_FENCE_RE.finditer(text):
         candidates.append(_ToolCallCandidate(source="code_fence", span=match.span(), payload=match.group("body").strip()))
+    for match in APPLY_PATCH_RE.finditer(text):
+        if _span_inside_any(match.span(), wrapper_spans):
+            continue
+        candidates.append(
+            _ToolCallCandidate(
+                source="bare_apply_patch",
+                span=match.span(),
+                payload=match.group("body").strip(),
+                name="apply_patch",
+            )
+        )
 
     stripped = text.strip()
     if stripped.startswith("{") and '"name"' in stripped:
@@ -286,6 +311,18 @@ def _parse_candidate(
     candidate: _ToolCallCandidate,
     specs_by_name: dict[str, ToolSpec],
 ) -> tuple[tuple[str, dict[str, Any]] | None, str | None]:
+    if candidate.source == "bare_apply_patch":
+        patch = _normalize_apply_patch(candidate.payload)
+        spec = specs_by_name.get("apply_patch")
+        if spec:
+            if spec.type == "custom":
+                return ("apply_patch", {"input": patch}), None
+            return ("apply_patch", {"arguments": {"patch": patch}}), None
+        apply_patch_shell = _build_apply_patch_shell_fallback(patch, specs_by_name)
+        if apply_patch_shell:
+            return apply_patch_shell, None
+        return None, "apply_patch tool was not declared."
+
     if candidate.source in {"named_xml", "tool_record", "custom_tool_record", "self_closing_xml"}:
         if not candidate.name:
             return None, "Named tool call missing tool name."
@@ -298,7 +335,10 @@ def _parse_candidate(
                 return None, f"Invalid {candidate.name} XML attributes."
             return (candidate.name, payload), None
         if spec.type == "custom" or candidate.source == "custom_tool_record":
-            return (candidate.name, {"input": _strip_code_fence(candidate.payload)}), None
+            payload = _strip_code_fence(candidate.payload)
+            if candidate.name == "apply_patch":
+                payload = _normalize_apply_patch(payload)
+            return (candidate.name, {"input": payload}), None
         payload, error = _loads_json_object(candidate.payload)
         if error:
             xml_arguments = _parse_xml_arguments(candidate.payload, spec.parameters or {})
@@ -342,10 +382,20 @@ def _parse_apply_patch_shell_fallback(
     if shell_spec is None:
         return None
 
-    match = re.search(r"<apply_patch>\s*(?P<body>.*?)\s*</apply_patch>", payload, re.DOTALL | re.IGNORECASE)
+    match = APPLY_PATCH_RE.search(payload)
     if not match:
         return None
-    patch = _strip_code_fence(match.group("body").strip())
+    patch = _normalize_apply_patch(match.group("body").strip())
+    return _build_apply_patch_shell_fallback(patch, specs_by_name)
+
+
+def _build_apply_patch_shell_fallback(
+    patch: str,
+    specs_by_name: dict[str, ToolSpec],
+) -> tuple[str, dict[str, Any]] | None:
+    shell_spec = _select_shell_like_tool(specs_by_name)
+    if shell_spec is None:
+        return None
     if not patch.startswith("*** Begin Patch") or "*** End Patch" not in patch:
         return None
 
@@ -377,6 +427,13 @@ def _apply_patch_command(patch: str) -> str:
     while delimiter in patch:
         delimiter += "_EOF"
     return f"apply_patch <<'{delimiter}'\n{patch}\n{delimiter}"
+
+
+def _normalize_apply_patch(patch: str) -> str:
+    normalized = _strip_code_fence(patch)
+    normalized = re.sub(r"(?m)^\*\*\* Create File:", "*** Add File:", normalized)
+    normalized = re.sub(r"(?m)(^\*\*\* Add File:[^\n]*\n)@@\n", r"\1", normalized)
+    return normalized
 
 
 def _parse_wrapped_named_xml(

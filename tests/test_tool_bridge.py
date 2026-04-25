@@ -21,6 +21,7 @@ def test_tool_prompt_contains_declared_schema():
     assert "<tool_call>" in prompt
     assert "exec_command" in prompt
     assert "at most one" in prompt
+    assert "<apply_patch>" not in prompt
 
 
 def test_tool_prompt_prefers_named_xml_for_custom_tools():
@@ -260,6 +261,46 @@ def test_parse_apply_patch_falls_back_to_declared_exec_command_when_custom_tool_
     assert "Add File: file_organizer.py" in arguments
     assert "<tool_call>" not in result.stripped_text
     assert "<apply_patch>" not in result.stripped_text
+
+
+def test_parse_bare_apply_patch_falls_back_to_declared_exec_command_for_v4_regression():
+    text = """我来为你创建一个文件整理工具。
+
+<apply_patch>
+*** Begin Patch
+*** Create File: /home/damon/test/file_organizer.py
+@@
++print("hi")
+*** End Patch
+</apply_patch>"""
+    result = parse_tool_calls(text, TOOLS)
+    assert not result.errors
+    item = result.calls[0].to_response_item()
+    assert item["type"] == "function_call"
+    assert item["name"] == "exec_command"
+    arguments = item["arguments"]
+    assert "apply_patch <<'PATCH'" in arguments
+    assert "Add File: /home/damon/test/file_organizer.py" in arguments
+    assert "Create File" not in arguments
+    assert "<apply_patch>" not in result.stripped_text
+
+
+def test_parse_bare_apply_patch_uses_custom_tool_when_declared():
+    tools = [{"type": "custom", "name": "apply_patch", "format": {"type": "grammar"}}]
+    text = """<apply_patch>
+*** Begin Patch
+*** Create File: file_organizer.py
+@@
++print("hi")
+*** End Patch
+</apply_patch>"""
+    result = parse_tool_calls(text, tools)
+    assert not result.errors
+    item = result.calls[0].to_response_item()
+    assert item["type"] == "custom_tool_call"
+    assert item["name"] == "apply_patch"
+    assert "Add File: file_organizer.py" in item["input"]
+    assert "Create File" not in item["input"]
 
 
 def test_invalid_tool_markup_is_stripped_from_fallback_text():

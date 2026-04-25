@@ -31,7 +31,7 @@ SDU_DEEPSEEK_SKIP_LOGIN=1 .codex-venv/bin/pytest -q
 Result:
 
 ```text
-62 passed, 3 skipped in 0.82s
+65 passed, 3 skipped in 1.34s
 ```
 
 Coverage areas:
@@ -51,6 +51,7 @@ Coverage areas:
 | Custom-tool XML prompt guidance | Passed |
 | Valid tool call parsing | Passed |
 | Fenced JSON tool call parsing | Passed |
+| Bare `<apply_patch>` V4 regression parsing | Passed |
 | Codex-style named XML tool parsing | Passed |
 | Codex-style named XML tool streaming | Passed |
 | `update_plan` empty-item repair | Passed |
@@ -66,6 +67,7 @@ Coverage areas:
 | Custom/freeform tool parsing | Passed |
 | Think-model apply_patch custom-tool streaming buffer | Passed |
 | Think-model apply_patch fallback to declared `exec_command` | Passed |
+| V4 bare apply_patch fallback to declared `exec_command` | Passed |
 | Unclosed custom-tool wrapper recovery | Passed |
 | Top-level function argument recovery | Passed |
 | Responses non-stream text route for V3.2, V3.2-think, V4 | Passed |
@@ -154,6 +156,20 @@ deepseek-ai/DeepSeek-V4: Codex executed exec_command pwd and returned the temp w
 ```
 
 No raw `<tool_call>`, `<apply_patch>`, or `<think>` markup appeared as the final assistant answer in these runs.
+
+V4 regression smoke for the reported prompt shape:
+
+```bash
+env SDU_DEEPSEEK_API_KEY=dummy CODEX_HOME=/tmp/codex-sdu-v4-regression-home codex exec \
+  --ephemeral --skip-git-repo-check --sandbox workspace-write \
+  -C /tmp/sdu-codex-v4-regression-... \
+  -c 'model_providers.sdu_deepseek={name="SDU DeepSeek Local", base_url="http://127.0.0.1:18084/v1", env_key="SDU_DEEPSEEK_API_KEY", wire_api="responses", stream_idle_timeout_ms=300000}' \
+  -c model_provider="sdu_deepseek" \
+  -m deepseek-ai/DeepSeek-V4 \
+  '帮我写一个python程序，关于文件整理的。请创建 file_organizer.py，代码可以简单但要能运行，然后读取文件确认。'
+```
+
+Result: Codex created `file_organizer.py`, then read it back with `cat`. It used declared shell/function tooling and did not expose raw `<apply_patch>` as the final assistant message.
 
 Older baseline runs from the previous report also validated simple text, V3.2 `exec_command`, and V3.2 file creation/read loops; those commands used a Linux venv path and are superseded by the focused run above for this branch.
 

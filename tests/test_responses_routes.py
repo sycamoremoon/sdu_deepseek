@@ -412,6 +412,54 @@ def test_function_tool_response_with_top_level_arguments(client, mock_sdu):
     }
 
 
+def test_v4_bare_apply_patch_without_custom_tool_falls_back_to_exec_command(client, mock_sdu):
+    mock_sdu(
+        [
+            {
+                "content": (
+                    "我来为你创建一个文件整理工具。\n\n"
+                    "<apply_patch>\n"
+                    "*** Begin Patch\n"
+                    "*** Create File: /home/damon/test/file_organizer.py\n"
+                    "@@\n"
+                    '+print("organizer ok")\n'
+                    "*** End Patch\n"
+                    "</apply_patch>"
+                ),
+                "reasoning_content": "",
+            }
+        ]
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V4",
+            "input": "write file",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                }
+            ],
+        },
+    )
+    body = response.json()
+    assert response.status_code == 200
+    assert body["output_text"] == ""
+    assert body["output"][0]["type"] == "function_call"
+    assert body["output"][0]["name"] == "exec_command"
+    arguments = json.loads(body["output"][0]["arguments"])
+    assert "apply_patch <<'PATCH'" in arguments["cmd"]
+    assert "Add File: /home/damon/test/file_organizer.py" in arguments["cmd"]
+    assert "Create File" not in arguments["cmd"]
+    assert "<apply_patch>" not in body["output_text"]
+
+
 def test_stream_think_then_tool_call_events(client, mock_sdu):
     mock_sdu(
         [
