@@ -1,0 +1,56 @@
+{
+  "cookies_present": true,
+  "endpoint": "https://aiassist.sdu.edu.cn/site/ai/compose_chat",
+  "generated_at": 1777105603,
+  "live_enabled": false,
+  "live_results": {
+    "skipped": "Set RUN_LIVE_SDU_PROBE=1 or pass --live to send low-frequency live requests."
+  },
+  "static_results": [
+    {
+      "capability": "Known SDU endpoint scope",
+      "compatibility_strategy": "Keep probes and compatibility layer scoped to compose_chat unless same-origin web evidence is added.",
+      "evidence_summary": "The repository only calls https://aiassist.sdu.edu.cn/site/ai/compose_chat for AI chat.",
+      "method": "Static source inspection",
+      "request_format": "sduwrap.url points to /site/ai/compose_chat only",
+      "response_format": "Streaming lines beginning with data:",
+      "supported": "yes"
+    },
+    {
+      "capability": "Form data chat request",
+      "compatibility_strategy": "Responses API should convert text turns to the existing content/history form contract.",
+      "evidence_summary": "sduwrap.make_chat_request builds form data and sduwrap.chat posts with data=form_data, stream=True.",
+      "method": "Static source inspection",
+      "request_format": "application/x-www-form-urlencoded fields: content, history[n][role], history[n][content], compose_id, auth_tag, deep_search, internet_search, model_name, thinking_budget, chat_only_id",
+      "response_format": "SSE-like data lines containing JSON with d.answer",
+      "supported": "yes"
+    },
+    {
+      "capability": "Native tool/function calling",
+      "compatibility_strategy": "Implement protocol-level tool bridge by prompt injection and local parsing; never execute Codex tools server-side.",
+      "evidence_summary": "No function/tool/plugin schema or tool result field is present in current code.",
+      "method": "Static source inspection",
+      "request_format": "No tool fields in compose_chat form data",
+      "response_format": "Only text chunks from d.answer are parsed",
+      "supported": "no evidence"
+    },
+    {
+      "capability": "Native image/file input",
+      "compatibility_strategy": "Return explicit unsupported_input_image/unsupported_input_file unless a same-origin upload API is verified later.",
+      "evidence_summary": "The known compose_chat request accepts content text and history text only.",
+      "method": "Static source inspection",
+      "request_format": "No multipart, file id, image_url, or upload endpoint in current code",
+      "response_format": "Only text chunks from d.answer are parsed",
+      "supported": "no evidence"
+    },
+    {
+      "capability": "Reasoning content",
+      "compatibility_strategy": "Map parsed reasoning_content to Responses reasoning summary/text compatibility fields.",
+      "evidence_summary": "Reasoning is parsed from model text markers, not a separate typed response field in the current code.",
+      "method": "Static source inspection",
+      "request_format": "thinking_budget is sent with model_name; deep_search/internet_search are numeric form fields",
+      "response_format": "sduwrap.ChatStream splits escaped <think\\>...</think\\> markers into reasoning_content",
+      "supported": "best effort"
+    }
+  ]
+}

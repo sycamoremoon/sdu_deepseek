@@ -43,6 +43,11 @@ INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 - `GET /v1/models` - 获取模型列表
 - `GET /v1/models/{model_id}` - 获取模型信息
 - `POST /v1/chat/completions` - 聊天完成接口
+- `POST /v1/responses` - OpenAI Responses API 兼容接口，推荐用于 Codex CLI / Codex IDE custom provider
+- `POST /responses` - `/v1/responses` 的兼容别名
+- `GET /v1/responses/{response_id}` - 获取内存中的 Responses 响应
+- `DELETE /v1/responses/{response_id}` - 删除内存中的 Responses 响应
+- `GET /v1/responses/{response_id}/input_items` - 获取已记录的输入项
 
 ## 支持的模型
 
@@ -80,6 +85,25 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+### Responses API 请求
+
+```bash
+curl -X POST http://localhost:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy" \
+  -d '{
+    "model": "deepseek-ai/DeepSeek-V3.2",
+    "input": "你好",
+    "stream": false
+  }'
+```
+
+### Codex custom provider
+
+示例配置见 `docs/codex_provider_setup.md`。本地服务接受任意 dummy API key；SDU 登录仍使用现有 `cookies.json` / `credentials.json` / 登录流程。
+
+当前 Responses 兼容层支持普通文本、Responses 语义 SSE、内存 `previous_response_id`、reasoning best-effort 映射、function tool 协议桥接。SDU 已验证网页端是文本 form-data 流，未发现原生图片/文件/工具调用接口，因此多模态输入会返回明确的 unsupported 错误。
 
 ## 特殊参数
 

@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import json
@@ -12,6 +12,24 @@ import threading
 import os
 import sduwrap
 from sduwrap import ChatConfig
+from responses_adapter import (
+    append_response_to_conversation,
+    build_output_items,
+    build_response_object,
+    message_output_item,
+    prepare_responses_request,
+)
+from responses_models import ResponsesRequest, UnsupportedInputError, error_response
+from responses_store import response_store
+from streaming import (
+    message_delta_event,
+    message_done_events,
+    message_start_events,
+    response_completed_event,
+    response_created_events,
+    response_failed_event,
+    tool_call_events,
+)
 from fastchat.protocol.openai_api_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -155,7 +173,9 @@ def print_stats_summary():
               f"Total: {token_stats['total_tokens']}")
 
 
-if not load_cookies():
+if os.environ.get("SDU_DEEPSEEK_SKIP_LOGIN") == "1":
+    print("[Cookies] Skipped login because SDU_DEEPSEEK_SKIP_LOGIN=1")
+elif not load_cookies():
     login()
 
 app = FastAPI(title="SDU DeepSeek API", description="OpenAI-compatible API for SDU DeepSeek")
@@ -207,6 +227,256 @@ def get_config_for_model(model: str, thinking_budget: int = 1000) -> ChatConfig:
     config.set_model(internal_model)
     config.thinking_budget = thinking_budget
     return config
+
+
+def get_response_thinking_budget(request: ResponsesRequest) -> int:
+    if request.thinking_budget:
+        return request.thinking_budget
+    reasoning = request.reasoning
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort == "high":
+            return 2000
+        if effort == "medium":
+            return 1000
+        if effort == "low":
+            return 500
+    return 1000
+
+
+def collect_sdu_response(current_input: str, history, config: ChatConfig) -> tuple[str, str]:
+    full_content = ""
+    full_reasoning = ""
+    for chunk in sduwrap.chat(current_input, history, config):
+        full_content += chunk.get("content", "")
+        full_reasoning += chunk.get("reasoning_content", "")
+    return full_content, full_reasoning
+
+
+def response_not_found(response_id: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content=error_response(
+            "response_not_found",
+            f"Response {response_id} not found in the in-memory store.",
+            "response_id",
+        ),
+    )
+
+
+@app.get("/v1/responses/{response_id}/input_items")
+@app.get("/responses/{response_id}/input_items")
+async def get_response_input_items(response_id: str):
+    stored = response_store.get(response_id)
+    if not stored:
+        return response_not_found(response_id)
+    return {
+        "object": "list",
+        "data": stored.input_items,
+        "has_more": False,
+        "first_id": stored.input_items[0].get("id") if stored.input_items and isinstance(stored.input_items[0], dict) else None,
+        "last_id": stored.input_items[-1].get("id") if stored.input_items and isinstance(stored.input_items[-1], dict) else None,
+    }
+
+
+@app.get("/v1/responses/{response_id}")
+@app.get("/responses/{response_id}")
+async def get_response(response_id: str):
+    response = response_store.get_response(response_id)
+    if not response:
+        return response_not_found(response_id)
+    return response
+
+
+@app.delete("/v1/responses/{response_id}")
+@app.delete("/responses/{response_id}")
+async def delete_response(response_id: str):
+    deleted = response_store.delete(response_id)
+    return {"id": response_id, "object": "response.deleted", "deleted": deleted}
+
+
+@app.post("/v1/responses")
+@app.post("/responses")
+async def openai_responses(request: ResponsesRequest):
+    try:
+        prepared = prepare_responses_request(request, response_store)
+    except UnsupportedInputError as exc:
+        return JSONResponse(status_code=400, content=exc.as_error())
+
+    config = get_config_for_model(request.model, get_response_thinking_budget(request))
+    response_id = f"resp_{uuid.uuid4().hex[:24]}"
+    created_at = int(time.time())
+
+    if request.stream:
+        return StreamingResponse(
+            generate_responses_stream(request, prepared, config, response_id, created_at),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    prompt_tokens = len(prepared.current_input) + sum(len(message.content) for message in prepared.history)
+    try:
+        full_content, full_reasoning = collect_sdu_response(
+            prepared.current_input,
+            prepared.to_sdu_history(),
+            config,
+        )
+    except Exception as exc:
+        response = build_response_object(
+            request,
+            response_id=response_id,
+            created_at=created_at,
+            output=[],
+            status="failed",
+            previous_response_id=request.previous_response_id,
+            error={"message": str(exc), "type": "sdu_backend_error", "code": "sdu_backend_error"},
+        )
+        response_store.put(response, prepared.conversation, prepared.input_items, persistent=request.store is not False)
+        return JSONResponse(status_code=502, content=response)
+
+    output, tool_errors = build_output_items(full_content, full_reasoning, request)
+    response = build_response_object(
+        request,
+        response_id=response_id,
+        created_at=created_at,
+        output=output,
+        reasoning_text=full_reasoning,
+        previous_response_id=request.previous_response_id,
+    )
+    if tool_errors:
+        response["compatibility_warnings"] = tool_errors
+    conversation = append_response_to_conversation(prepared.conversation, output)
+    response_store.put(response, conversation, prepared.input_items, persistent=request.store is not False)
+
+    completion_tokens = len(response.get("output_text", "")) + len(full_reasoning)
+    update_stats(prompt_tokens, completion_tokens)
+    return response
+
+
+async def generate_responses_stream(
+    request: ResponsesRequest,
+    prepared,
+    config: ChatConfig,
+    response_id: str,
+    created_at: int,
+):
+    seed_response = build_response_object(
+        request,
+        response_id=response_id,
+        created_at=created_at,
+        output=[],
+        status="in_progress",
+        previous_response_id=request.previous_response_id,
+    )
+    for event in response_created_events(seed_response):
+        yield event
+
+    q = queue.Queue()
+    loop = asyncio.get_event_loop()
+    history = prepared.to_sdu_history()
+
+    def run_chat():
+        try:
+            for chunk in sduwrap.chat(prepared.current_input, history, config):
+                q.put(chunk)
+        except Exception as exc:
+            q.put({"error": str(exc)})
+        finally:
+            q.put(None)
+
+    thread = threading.Thread(target=run_chat)
+    thread.start()
+
+    content = ""
+    reasoning = ""
+    prompt_tokens = len(prepared.current_input) + sum(len(message.content) for message in prepared.history)
+    buffer_for_tools = bool(request.tools)
+    stream_item = None
+
+    if not buffer_for_tools:
+        stream_item = message_output_item("")
+        for event in message_start_events(stream_item):
+            yield event
+
+    failed_response = None
+    while True:
+        chunk = await loop.run_in_executor(executor, q.get)
+        if chunk is None:
+            break
+        if "error" in chunk:
+            failed_response = build_response_object(
+                request,
+                response_id=response_id,
+                created_at=created_at,
+                output=[],
+                status="failed",
+                previous_response_id=request.previous_response_id,
+                error={"message": chunk["error"], "type": "sdu_backend_error", "code": "sdu_backend_error"},
+            )
+            yield response_failed_event(failed_response)
+            break
+
+        delta = chunk.get("content", "")
+        reasoning_delta = chunk.get("reasoning_content", "")
+        if reasoning_delta:
+            reasoning += reasoning_delta
+            yield (
+                "event: response.reasoning_summary_text.delta\n"
+                f"data: {json.dumps({'type': 'response.reasoning_summary_text.delta', 'delta': reasoning_delta}, ensure_ascii=False)}\n\n"
+            )
+        if delta:
+            content += delta
+            if stream_item is not None:
+                stream_item["content"][0]["text"] += delta
+                yield message_delta_event(stream_item, delta)
+
+    thread.join()
+
+    if failed_response is not None:
+        response_store.put(failed_response, prepared.conversation, prepared.input_items, persistent=request.store is not False)
+        return
+
+    if buffer_for_tools:
+        output, tool_errors = build_output_items(content, reasoning, request)
+        for output_index, item in enumerate(output):
+            if item.get("type") in {"function_call", "custom_tool_call"}:
+                for event in tool_call_events(item, output_index):
+                    yield event
+            else:
+                for event in message_start_events(item, output_index):
+                    yield event
+                text = item.get("content", [{}])[0].get("text", "")
+                if text:
+                    yield message_delta_event(item, text, output_index)
+                for event in message_done_events(item, output_index):
+                    yield event
+    else:
+        output = [stream_item] if stream_item is not None else [message_output_item(content)]
+        tool_errors = []
+        if stream_item is not None:
+            for event in message_done_events(stream_item):
+                yield event
+
+    if reasoning:
+        yield (
+            "event: response.reasoning_summary_text.done\n"
+            f"data: {json.dumps({'type': 'response.reasoning_summary_text.done', 'text': reasoning}, ensure_ascii=False)}\n\n"
+        )
+
+    response = build_response_object(
+        request,
+        response_id=response_id,
+        created_at=created_at,
+        output=output,
+        reasoning_text=reasoning,
+        previous_response_id=request.previous_response_id,
+    )
+    if tool_errors:
+        response["compatibility_warnings"] = tool_errors
+    conversation = append_response_to_conversation(prepared.conversation, output)
+    response_store.put(response, conversation, prepared.input_items, persistent=request.store is not False)
+    update_stats(prompt_tokens, len(response.get("output_text", "")) + len(reasoning))
+    yield response_completed_event(response)
 
 
 @app.get("/v1/models")
@@ -315,7 +585,9 @@ async def openai_chat_completion(request: ChatCompletionRequest):
                             )
                         ],
                     )
-                    yield f"data: {stream_response.model_dump_json()}\n\n"
+                    payload = stream_response.model_dump()
+                    payload["choices"][0]["delta"]["reasoning_content"] = reasoning
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 
                 if content:
                     stream_response = ChatCompletionStreamResponse(
@@ -382,8 +654,6 @@ async def openai_chat_completion(request: ChatCompletionRequest):
             role="assistant",
             content=full_content,
         )
-        if full_reasoning:
-            message.reasoning_content = full_reasoning
         
         response = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -404,7 +674,10 @@ async def openai_chat_completion(request: ChatCompletionRequest):
             ),
         )
         
-        return response.model_dump()
+        payload = response.model_dump()
+        if full_reasoning:
+            payload["choices"][0]["message"]["reasoning_content"] = full_reasoning
+        return payload
 
 
 if __name__ == "__main__":
