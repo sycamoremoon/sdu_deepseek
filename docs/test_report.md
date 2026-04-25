@@ -30,7 +30,7 @@ SDU_DEEPSEEK_SKIP_LOGIN=1 /home/damon/.local/venvs/tools/bin/pytest -q
 Result:
 
 ```text
-40 passed, 1 skipped in 0.63s
+46 passed, 3 skipped in 0.69s
 ```
 
 Coverage areas:
@@ -44,7 +44,10 @@ Coverage areas:
 | `function_call_output` conversion | Passed |
 | `previous_response_id` in-memory store | Passed |
 | Reasoning content response mapping | Passed |
+| Plain `<think>...</think>` parsing | Passed |
+| Split `<think>` chunk parsing | Passed |
 | Tool prompt injection | Passed |
+| Custom-tool XML prompt guidance | Passed |
 | Valid tool call parsing | Passed |
 | Codex-style named XML tool parsing | Passed |
 | Codex-style named XML tool streaming | Passed |
@@ -58,6 +61,8 @@ Coverage areas:
 | Unknown tool name handling | Passed |
 | Schema mismatch handling | Passed |
 | Custom/freeform tool parsing | Passed |
+| Unclosed custom-tool wrapper recovery | Passed |
+| Top-level function argument recovery | Passed |
 | Responses non-stream text route | Passed |
 | Responses SSE text stream | Passed |
 | Responses SSE function-call stream | Passed |
@@ -89,10 +94,10 @@ RUN_LIVE_SDU_TESTS=1 SDU_DEEPSEEK_SKIP_LOGIN=1 /home/damon/.local/venvs/tools/bi
 Result:
 
 ```text
-1 passed in 8.25s
+3 passed in 25.23s
 ```
 
-The live test loads `cookies.json` into memory and sends one low-frequency text request to the existing `compose_chat` endpoint. No cookies or credentials are printed.
+The live tests load `cookies.json` into memory and send low-frequency text requests to the existing `compose_chat` endpoint. No cookies or credentials are printed.
 
 ## Codex End-To-End
 

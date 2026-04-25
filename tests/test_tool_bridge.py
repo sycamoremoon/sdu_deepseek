@@ -23,6 +23,17 @@ def test_tool_prompt_contains_declared_schema():
     assert "at most one" in prompt
 
 
+def test_tool_prompt_prefers_named_xml_for_custom_tools():
+    prompt = build_tool_prompt(
+        [
+            {"type": "custom", "name": "apply_patch", "format": {"type": "grammar"}},
+        ],
+        parallel_tool_calls=False,
+    )
+    assert "<apply_patch>" in prompt
+    assert "not JSON-escaped" in prompt
+
+
 def test_parse_valid_tool_call():
     result = parse_tool_calls('<tool_call>{"name":"exec_command","arguments":{"cmd":"pwd"}}</tool_call>', TOOLS)
     assert not result.errors
@@ -60,6 +71,27 @@ def test_parse_custom_tool_call():
     assert item["type"] == "custom_tool_call"
     assert item["name"] == "apply_patch"
     assert "Begin Patch" in item["input"]
+
+
+def test_parse_custom_tool_call_named_xml_body():
+    tools = [{"type": "custom", "name": "apply_patch", "format": {"type": "grammar"}}]
+    result = parse_tool_calls("<apply_patch>\n*** Begin Patch\n*** End Patch\n</apply_patch>", tools)
+    assert not result.errors
+    item = result.calls[0].to_response_item()
+    assert item["type"] == "custom_tool_call"
+    assert item["name"] == "apply_patch"
+    assert item["input"].startswith("*** Begin Patch")
+
+
+def test_parse_custom_tool_call_with_unclosed_wrapper_and_loose_input():
+    tools = [{"type": "custom", "name": "apply_patch", "format": {"type": "grammar"}}]
+    text = '<tool_call>{"name":"apply_patch","input":"*** Begin Patch\n*** Add File: hello.py\n+print("hi")\n*** End Patch\n"}]()}'
+    result = parse_tool_calls(text, tools)
+    assert not result.errors
+    item = result.calls[0].to_response_item()
+    assert item["type"] == "custom_tool_call"
+    assert "Add File: hello.py" in item["input"]
+    assert 'print("hi")' in item["input"]
 
 
 def test_parse_codex_named_xml_tool_call():
@@ -153,3 +185,27 @@ arguments_json: {"cmd":"cat hello.py"}"""
     item = result.calls[0].to_response_item()
     assert item["name"] == "exec_command"
     assert item["arguments"] == '{"cmd":"cat hello.py"}'
+
+
+def test_parse_function_tool_call_with_top_level_arguments():
+    tools = [
+        {
+            "type": "function",
+            "name": "exec_command",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string"},
+                    "workdir": {"type": "string"},
+                },
+                "required": ["cmd"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    text = '<tool_call>{"name":"exec_command","cmd":"python3 /tmp/demo.py --help","workdir":"/tmp/demo"}</tool_call>'
+    result = parse_tool_calls(text, tools)
+    assert not result.errors
+    item = result.calls[0].to_response_item()
+    assert item["name"] == "exec_command"
+    assert item["arguments"] == '{"cmd":"python3 /tmp/demo.py --help","workdir":"/tmp/demo"}'

@@ -10,6 +10,7 @@ from typing import Any
 
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 TOOL_CALL_TAG_RE = re.compile(r"</?tool_call>", re.IGNORECASE)
+TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>\s*", re.IGNORECASE)
 TOOL_RECORD_RE = re.compile(
     r"(?:^|\n)\s*Tool call requested:\s*(?P<name>[A-Za-z_][\w.-]*)\s+"
     r"(?:call_id=\S+\s+)?arguments=(?P<arguments>\{.*?\})\s*(?=$|\n)",
@@ -137,8 +138,9 @@ def build_tool_prompt(tools: list[Any] | None, parallel_tool_calls: bool | None)
         '<tool_call>{"name":"tool_name","arguments":{...}}</tool_call>\n'
         "Codex-style named XML is also accepted when you cannot produce the JSON wrapper:\n"
         '<tool_name>{"arg":"value"}</tool_name>\n'
-        "For custom/freeform tools, use a string field named input, for example:\n"
-        '<tool_call>{"name":"apply_patch","input":"*** Begin Patch\\n...\\n*** End Patch\\n"}</tool_call>\n'
+        "For custom/freeform tools, prefer named XML so the body is not JSON-escaped, for example:\n"
+        "<apply_patch>\n*** Begin Patch\n...\n*** End Patch\n</apply_patch>\n"
+        "If you must use the JSON wrapper for a custom/freeform tool, use a string field named input.\n"
         f"{limit_text}\n"
         "When calling a tool, output only the tool call and stop. Do not wrap it in Markdown or explanatory prose.\n"
         "Use only tool names declared below. If no tool is needed, answer normally.\n"
@@ -187,6 +189,13 @@ def _extract_tool_call_candidates(text: str, specs_by_name: dict[str, ToolSpec])
     for match in TOOL_CALL_RE.finditer(text):
         wrapper_spans.append(match.span())
         candidates.append(_ToolCallCandidate(source="tool_call", span=match.span(), payload=match.group(1).strip()))
+    for match in TOOL_CALL_OPEN_RE.finditer(text):
+        span = (match.start(), len(text))
+        if _span_inside_any(span, wrapper_spans):
+            continue
+        if "</tool_call>" in text[match.end():]:
+            continue
+        candidates.append(_ToolCallCandidate(source="open_tool_call", span=span, payload=text[match.end():].strip()))
 
     if not specs_by_name:
         return candidates
@@ -283,6 +292,9 @@ def _parse_candidate(
         nested = _parse_wrapped_named_xml(candidate.payload, specs_by_name)
         if nested:
             return nested, None
+        loose = _parse_loose_tool_object(candidate.payload, specs_by_name)
+        if loose:
+            return loose, None
         return None, f"Invalid tool_call JSON: {error}"
 
     name = payload.get("name")
@@ -291,7 +303,10 @@ def _parse_candidate(
         if shorthand:
             return shorthand, None
         return None, "Tool call payload missing string name."
-    return (name, payload), None
+    normalized, normalize_error = _normalize_named_payload(name, payload, specs_by_name)
+    if normalize_error:
+        return None, normalize_error
+    return (name, normalized), None
 
 
 def _parse_wrapped_named_xml(
@@ -333,6 +348,34 @@ def _parse_tool_name_shorthand(
     return name, {"arguments": value}
 
 
+def _normalize_named_payload(
+    name: str,
+    payload: dict[str, Any],
+    specs_by_name: dict[str, ToolSpec],
+) -> tuple[dict[str, Any] | None, str | None]:
+    spec = specs_by_name.get(name)
+    if not spec:
+        return None, f"Unknown tool name: {name}"
+
+    if spec.type == "custom":
+        if isinstance(payload.get("input"), str):
+            return {"input": payload["input"]}, None
+        if isinstance(payload.get("arguments"), str):
+            return {"input": payload["arguments"]}, None
+        return None, f"Custom tool {name} requires string input."
+
+    if isinstance(payload.get("arguments"), dict):
+        return {"arguments": payload["arguments"]}, None
+    if isinstance(payload.get("arguments"), str):
+        return {"arguments": payload["arguments"]}, None
+
+    reserved_keys = {"name", "type", "call_id", "status"}
+    arguments = {key: value for key, value in payload.items() if key not in reserved_keys}
+    if arguments:
+        return {"arguments": arguments}, None
+    return {"arguments": {}}, None
+
+
 def _parse_self_closing_named_xml(
     payload: str,
     specs_by_name: dict[str, ToolSpec],
@@ -349,6 +392,32 @@ def _parse_self_closing_named_xml(
     if parsed is None:
         return None
     return name, parsed
+
+
+def _parse_loose_tool_object(
+    payload: str,
+    specs_by_name: dict[str, ToolSpec],
+) -> tuple[str, dict[str, Any]] | None:
+    cleaned = _strip_code_fence(payload).strip()
+    name_match = re.search(r'"name"\s*:\s*"(?P<name>[A-Za-z_][\w.-]*)"', cleaned)
+    if not name_match:
+        return None
+    name = name_match.group("name")
+    spec = specs_by_name.get(name)
+    if not spec:
+        return None
+
+    if spec.type != "custom":
+        return None
+
+    input_match = re.search(r'"input"\s*:\s*"', cleaned)
+    if not input_match:
+        return None
+    raw_input = cleaned[input_match.end():]
+    end_match = re.search(r'"\s*}\s*(?:</tool_call>|\]\(\)|\)\s*)?$', raw_input, re.DOTALL)
+    if end_match:
+        raw_input = raw_input[:end_match.start()]
+    return name, {"input": _decode_loose_json_string(raw_input)}
 
 
 def _parse_xml_attributes(attrs: str, spec: ToolSpec) -> dict[str, Any] | None:
@@ -402,7 +471,10 @@ def _loads_json_object(raw_payload: str) -> tuple[dict[str, Any] | None, str | N
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        return None, exc.msg
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(cleaned)
+        except json.JSONDecodeError:
+            return None, exc.msg
     if not isinstance(payload, dict):
         return None, "payload must be a JSON object"
     return payload, None
@@ -416,6 +488,15 @@ def _strip_code_fence(text: str) -> str:
     if len(lines) >= 2 and lines[-1].strip() == "```":
         return "\n".join(lines[1:-1]).strip()
     return stripped
+
+
+def _decode_loose_json_string(text: str) -> str:
+    return (
+        text.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace('\\"', '"')
+        .replace("\\\\", "\\")
+    )
 
 
 def _parse_xml_arguments(payload: str, schema: dict[str, Any]) -> dict[str, Any] | None:

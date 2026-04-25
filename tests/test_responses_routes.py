@@ -214,6 +214,77 @@ def test_stream_tool_call_events(client, mock_sdu):
     assert '"name":"exec_command"' in text
 
 
+def test_custom_tool_call_response_with_unclosed_wrapper(client, mock_sdu):
+    mock_sdu(
+        [
+            {
+                "content": '<tool_call>{"name":"apply_patch","input":"*** Begin Patch\n*** Add File: hello.py\n+print(\\"hi\\")\n*** End Patch\n"}]()}',
+                "reasoning_content": "",
+            }
+        ]
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V4",
+            "input": "write file",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "format": {"type": "grammar"},
+                }
+            ],
+        },
+    )
+    body = response.json()
+    assert response.status_code == 200
+    assert body["output"][0]["type"] == "custom_tool_call"
+    assert body["output"][0]["name"] == "apply_patch"
+    assert "Add File: hello.py" in body["output"][0]["input"]
+
+
+def test_function_tool_response_with_top_level_arguments(client, mock_sdu):
+    mock_sdu(
+        [
+            {
+                "content": '<tool_call>{"name":"exec_command","cmd":"python3 /home/test/test2/file_organizer.py --help","workdir":"/home/test/test2"}</tool_call>',
+                "reasoning_content": "",
+            }
+        ]
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V4",
+            "input": "run help",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                            "workdir": {"type": "string"},
+                        },
+                        "required": ["cmd"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+        },
+    )
+    body = response.json()
+    assert response.status_code == 200
+    assert body["output"][0]["type"] == "function_call"
+    assert body["output"][0]["name"] == "exec_command"
+    assert json.loads(body["output"][0]["arguments"]) == {
+        "cmd": "python3 /home/test/test2/file_organizer.py --help",
+        "workdir": "/home/test/test2",
+    }
+
+
 def test_stream_codex_named_xml_tool_call_events(client, mock_sdu):
     mock_sdu([{"content": '<update_plan>{"plan":[{"step":"创建文件","status":"in_progress"},{}]}</update_plan></tool_call>', "reasoning_content": ""}])
     with client.stream(
