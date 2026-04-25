@@ -9,6 +9,11 @@ def sse_event(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {data}\n\n"
 
 
+def sse_comment(comment: str = "keepalive") -> str:
+    safe = comment.replace("\n", " ")
+    return f": {safe}\n\n"
+
+
 def response_created_events(response: dict[str, Any]) -> Iterable[str]:
     empty_response = {**response, "output": []}
     yield sse_event("response.created", {"type": "response.created", "response": empty_response})

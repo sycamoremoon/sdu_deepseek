@@ -181,6 +181,229 @@ def test_tool_call_output_roundtrip(client, mock_sdu):
     assert response.json()["output_text"] == "final"
 
 
+def exec_tool_schema():
+    return {
+        "type": "function",
+        "name": "exec_command",
+        "parameters": {
+            "type": "object",
+            "properties": {"cmd": {"type": "string"}},
+            "required": ["cmd"],
+        },
+    }
+
+
+def update_plan_tool_schema():
+    return {
+        "type": "function",
+        "name": "update_plan",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "explanation": {"type": "string"},
+                "plan": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"step": {"type": "string"}, "status": {"type": "string"}},
+                        "required": ["step", "status"],
+                    },
+                },
+            },
+            "required": ["plan"],
+        },
+    }
+
+
+def post_tool_result(client, previous_response_id, call_item, output="ok", model="deepseek-ai/DeepSeek-V4"):
+    return client.post(
+        "/v1/responses",
+        json={
+            "model": model,
+            "previous_response_id": previous_response_id,
+            "store": False,
+            "tools": [exec_tool_schema(), update_plan_tool_schema()],
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": call_item["call_id"],
+                    "name": call_item["name"],
+                    "arguments": call_item["arguments"],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call_item["call_id"],
+                    "output": output,
+                },
+            ],
+        },
+    )
+
+
+def tool_call_text(cmd):
+    return '<tool_call>' + json.dumps({"name": "exec_command", "arguments": {"cmd": cmd}}, ensure_ascii=False) + "</tool_call>"
+
+
+def tool_plan_text():
+    return (
+        "<tool_plan>"
+        + json.dumps(
+            {
+                "explanation": "Continue the package implementation.",
+                "plan": [
+                    {"step": "Create package structure", "status": "completed"},
+                    {"step": "Write CLI and tests", "status": "in_progress"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "</tool_plan>"
+    )
+
+
+def test_v4_long_tool_loop_does_not_stop_early(client, monkeypatch):
+    tool_outputs = [
+        tool_call_text("mkdir -p file_organizer/file_organizer file_organizer/tests file_organizer/sample"),
+        tool_plan_text(),
+        tool_call_text("cat > file_organizer/file_organizer/organizer.py << 'EOF'\nprint('organizer')\nEOF"),
+        tool_call_text("cat > file_organizer/file_organizer/__init__.py << 'EOF'\nfrom .organizer import *\nEOF"),
+        tool_call_text("cat > file_organizer/file_organizer/cli.py << 'EOF'\nprint('cli')\nEOF"),
+        tool_call_text("cat > file_organizer/tests/test_organizer.py << 'EOF'\ndef test_ok(): assert True\nEOF"),
+        tool_call_text("cat > file_organizer/README.md << 'EOF'\n# File Organizer\nEOF"),
+        "All files, tests, docs, and samples are complete.",
+    ]
+    calls = {"count": 0}
+
+    def fake_chat(content, history, config):
+        index = calls["count"]
+        calls["count"] += 1
+        yield {"content": tool_outputs[index], "reasoning_content": ""}
+
+    import main
+
+    monkeypatch.setattr(main.sduwrap, "chat", fake_chat)
+
+    first = client.post(
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V4",
+            "input": "build the package",
+            "store": False,
+            "tools": [exec_tool_schema(), update_plan_tool_schema()],
+        },
+    )
+    assert first.status_code == 200
+    body = first.json()
+    assert body["output"][0]["type"] == "function_call"
+    assert body["output_text"] == ""
+    response_id = body["id"]
+    call_item = body["output"][0]
+    tool_names = [call_item["name"]]
+
+    for _ in range(6):
+        response = post_tool_result(client, response_id, call_item)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["output"][0]["type"] == "function_call"
+        assert body["output_text"] == ""
+        assert "<tool_call>" not in body["output_text"]
+        assert "<tool_plan>" not in body["output_text"]
+        response_id = body["id"]
+        call_item = body["output"][0]
+        tool_names.append(call_item["name"])
+
+    final = post_tool_result(client, response_id, call_item)
+    assert final.status_code == 200
+    body = final.json()
+    assert body["output"][0]["type"] == "message"
+    assert "complete" in body["output_text"]
+    assert "update_plan" in tool_names
+    assert calls["count"] == 8
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [{"content": "", "reasoning_content": ""}],
+        [{"content": "   \n\t", "reasoning_content": ""}],
+        [{"content": "", "reasoning_content": "thinking only"}],
+        [{"content": "<tool_call>{bad json}</tool_call>", "reasoning_content": ""}],
+    ],
+)
+def test_empty_or_filtered_model_output_is_not_silent_completed(client, mock_sdu, chunks):
+    mock_sdu(chunks)
+    response = client.post(
+        "/v1/responses",
+        json={"model": "deepseek-ai/DeepSeek-V4", "input": "continue", "tools": [exec_tool_schema()]},
+    )
+    assert response.status_code == 502
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["output"] == []
+    assert body["error"]["code"] == "sdu_empty_output"
+
+
+def test_tool_loop_code_block_work_is_not_silent_completed(client, mock_sdu):
+    mock_sdu(
+        [
+            {
+                "content": '继续写测试。</think>\n```python\ndef test_ok():\n    assert True\n```',
+                "reasoning_content": "",
+            }
+        ]
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V4",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_prev",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"mkdir -p tests"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_prev",
+                    "output": "ok",
+                },
+            ],
+            "tools": [exec_tool_schema()],
+        },
+    )
+    assert response.status_code == 502
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["output"] == []
+    assert "tool call" in body["error"]["message"]
+
+
+def test_function_call_output_preserves_tools_and_history(client, monkeypatch):
+    seen = {}
+
+    def fake_chat(content, history, config):
+        seen["content"] = content
+        seen["history"] = [item.content for item in history]
+        yield {"content": '<tool_call>{"name":"exec_command","arguments":{"cmd":"cat file_organizer/README.md"}}</tool_call>', "reasoning_content": ""}
+
+    import main
+
+    monkeypatch.setattr(main.sduwrap, "chat", fake_chat)
+
+    first = client.post(
+        "/v1/responses",
+        json={"model": "deepseek-ai/DeepSeek-V4", "input": "start", "tools": [exec_tool_schema()], "store": False},
+    ).json()
+    second = post_tool_result(client, first["id"], first["output"][0], output="mkdir ok")
+    assert second.status_code == 200
+    body = second.json()
+    assert body["output"][0]["type"] == "function_call"
+    assert "mkdir ok" in seen["content"]
+    assert "Tool result already returned by Codex" in seen["content"]
+    assert any("Previous tool call record" in item for item in seen["history"])
+
+
 def test_previous_response_id_and_get_delete(client, mock_sdu):
     mock_sdu([{"content": "first", "reasoning_content": ""}])
     first = client.post("/v1/responses", json={"model": "deepseek-ai/DeepSeek-V3.2", "input": "one"}).json()
@@ -258,6 +481,21 @@ def test_stream_tool_call_events(client, mock_sdu):
     assert "event: response.function_call_arguments.delta" in text
     assert "event: response.completed" in text
     assert '"name":"exec_command"' in text
+    assert text.index("event: response.output_item.done") < text.index("event: response.completed")
+
+
+def test_streaming_empty_output_fails_instead_of_completed(client, mock_sdu):
+    mock_sdu([{"content": "", "reasoning_content": ""}])
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"model": "deepseek-ai/DeepSeek-V4", "input": "continue", "stream": True, "tools": [exec_tool_schema()]},
+    ) as response:
+        text = response.read().decode("utf-8")
+    assert response.status_code == 200
+    assert "event: response.failed" in text
+    assert "event: response.completed" not in text
+    assert "sdu_empty_output" in text
 
 
 def test_custom_tool_call_response_with_unclosed_wrapper(client, mock_sdu):

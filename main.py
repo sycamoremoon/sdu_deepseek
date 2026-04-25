@@ -29,6 +29,7 @@ from streaming import (
     response_completed_event,
     response_created_events,
     response_failed_event,
+    sse_comment,
     tool_call_events,
 )
 from fastchat.protocol.openai_api_protocol import (
@@ -265,8 +266,70 @@ def should_stream_reasoning_events(request: ResponsesRequest) -> bool:
     return False
 
 
-def debug_compat_event(stage: str, request: ResponsesRequest, output: list[dict], reasoning: str, tool_errors: list[str]):
-    if os.environ.get("SDU_DEEPSEEK_DEBUG") != "1":
+def debug_enabled() -> bool:
+    return os.environ.get("SDU_DEEPSEEK_DEBUG") == "1"
+
+
+def tool_names(tools) -> list[str]:
+    names: list[str] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not name and isinstance(tool.get("function"), dict):
+            name = tool["function"].get("name")
+        if not name:
+            name = tool.get("type")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def input_item_types(items) -> list[str]:
+    result: list[str] = []
+    for item in items or []:
+        if isinstance(item, dict):
+            result.append(str(item.get("type") or ("message" if "role" in item else "unknown")))
+        else:
+            result.append(type(item).__name__)
+    return result
+
+
+def has_function_call_output(items) -> bool:
+    for item in items or []:
+        if isinstance(item, dict) and item.get("type") in {"function_call_output", "custom_tool_call_output"}:
+            return True
+    return False
+
+
+def debug_request_event(stage: str, request: ResponsesRequest, response_id: str, prepared=None, extra: dict | None = None):
+    if not debug_enabled():
+        return
+    payload = {
+        "stage": stage,
+        "response_id": response_id,
+        "model": request.model,
+        "stream": bool(request.stream),
+        "previous_response_id": request.previous_response_id,
+        "input_item_types": input_item_types(getattr(prepared, "input_items", [])),
+        "has_function_call_output": has_function_call_output(getattr(prepared, "input_items", [])),
+        "tools_count": len(request.tools or []),
+        "tool_names": tool_names(request.tools),
+        "stored_conversation_hit": bool(getattr(prepared, "stored_conversation_hit", False)),
+    }
+    if extra:
+        payload.update(extra)
+    print("[ResponsesState]", json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def debug_sse_event(response_id: str, event_type: str):
+    if not debug_enabled():
+        return
+    print("[ResponsesSSE]", json.dumps({"response_id": response_id, "event": event_type}, ensure_ascii=False), flush=True)
+
+
+def debug_compat_event(stage: str, request: ResponsesRequest, output: list[dict], reasoning: str, tool_errors: list[str], response_id: str | None = None):
+    if not debug_enabled():
         return
     items = []
     for item in output:
@@ -287,15 +350,52 @@ def debug_compat_event(stage: str, request: ResponsesRequest, output: list[dict]
         json.dumps(
             {
                 "stage": stage,
+                "response_id": response_id,
                 "model": request.model,
                 "stream": bool(request.stream),
                 "has_reasoning": bool(reasoning),
                 "output_items": items,
                 "tool_error_count": len(tool_errors),
+                "output_text_empty": output_text_is_empty(output),
             },
             ensure_ascii=False,
         ),
         flush=True,
+    )
+
+
+def output_has_tool_call(output: list[dict]) -> bool:
+    return any(item.get("type") in {"function_call", "custom_tool_call"} for item in output)
+
+
+def output_text_is_empty(output: list[dict]) -> bool:
+    for item in output:
+        if item.get("type") != "message":
+            continue
+        for part in item.get("content", []):
+            if isinstance(part, dict) and part.get("type") == "output_text" and str(part.get("text", "")).strip():
+                return False
+    return not output_has_tool_call(output)
+
+
+def build_empty_output_failed_response(
+    request: ResponsesRequest,
+    response_id: str,
+    created_at: int,
+    previous_response_id: str | None,
+    tool_errors: list[str] | None = None,
+) -> dict:
+    message = "SDU backend produced no convertible assistant output."
+    if tool_errors:
+        message = "SDU backend produced a tool call that could not be converted safely."
+    return build_response_object(
+        request,
+        response_id=response_id,
+        created_at=created_at,
+        output=[],
+        status="failed",
+        previous_response_id=previous_response_id,
+        error={"message": message, "type": "sdu_empty_output", "code": "sdu_empty_output"},
     )
 
 
@@ -344,14 +444,15 @@ async def delete_response(response_id: str):
 @app.post("/v1/responses")
 @app.post("/responses")
 async def openai_responses(request: ResponsesRequest):
+    response_id = f"resp_{uuid.uuid4().hex[:24]}"
+    created_at = int(time.time())
     try:
         prepared = prepare_responses_request(request, response_store)
     except UnsupportedInputError as exc:
         return JSONResponse(status_code=400, content=exc.as_error())
 
     config = get_config_for_model(request.model, get_response_thinking_budget(request))
-    response_id = f"resp_{uuid.uuid4().hex[:24]}"
-    created_at = int(time.time())
+    debug_request_event("request_received", request, response_id, prepared)
 
     if request.stream:
         return StreamingResponse(
@@ -381,7 +482,15 @@ async def openai_responses(request: ResponsesRequest):
         return JSONResponse(status_code=502, content=response)
 
     output, tool_errors = build_output_items(full_content, full_reasoning, request)
-    debug_compat_event("non_stream_output", request, output, full_reasoning, tool_errors)
+    debug_compat_event("non_stream_output", request, output, full_reasoning, tool_errors, response_id=response_id)
+    if not output or output_text_is_empty(output):
+        response = build_empty_output_failed_response(request, response_id, created_at, request.previous_response_id, tool_errors)
+        if tool_errors:
+            response["compatibility_warnings"] = tool_errors
+        response_store.put(response, prepared.conversation, prepared.input_items, persistent=request.store is not False)
+        debug_request_event("response_failed_empty_output", request, response_id, prepared, {"tool_error_count": len(tool_errors)})
+        return JSONResponse(status_code=502, content=response)
+
     response = build_response_object(
         request,
         response_id=response_id,
@@ -394,6 +503,17 @@ async def openai_responses(request: ResponsesRequest):
         response["compatibility_warnings"] = tool_errors
     conversation = append_response_to_conversation(prepared.conversation, output)
     response_store.put(response, conversation, prepared.input_items, persistent=request.store is not False)
+    debug_request_event(
+        "response_completed",
+        request,
+        response_id,
+        prepared,
+        {
+            "output_item_types": [item.get("type") for item in output],
+            "has_function_call": output_has_tool_call(output),
+            "output_text_empty": output_text_is_empty(output),
+        },
+    )
 
     completion_tokens = len(response.get("output_text", "")) + len(full_reasoning)
     update_stats(prompt_tokens, completion_tokens)
@@ -416,6 +536,7 @@ async def generate_responses_stream(
         previous_response_id=request.previous_response_id,
     )
     for event in response_created_events(seed_response):
+        debug_sse_event(response_id, "response.created" if "response.created" in event else "response.in_progress")
         yield event
 
     q = queue.Queue()
@@ -434,6 +555,12 @@ async def generate_responses_stream(
     thread = threading.Thread(target=run_chat)
     thread.start()
 
+    def get_next_chunk():
+        try:
+            return q.get(timeout=15)
+        except queue.Empty:
+            return {"keepalive": True}
+
     content = ""
     reasoning = ""
     prompt_tokens = len(prepared.current_input) + sum(len(message.content) for message in prepared.history)
@@ -444,13 +571,19 @@ async def generate_responses_stream(
     if not buffer_for_tools:
         stream_item = message_output_item("")
         for event in message_start_events(stream_item):
+            if "event: " in event:
+                debug_sse_event(response_id, event.split("\n", 1)[0].replace("event: ", ""))
             yield event
 
     failed_response = None
     while True:
-        chunk = await loop.run_in_executor(executor, q.get)
+        chunk = await loop.run_in_executor(executor, get_next_chunk)
         if chunk is None:
             break
+        if chunk.get("keepalive"):
+            debug_sse_event(response_id, "keepalive")
+            yield sse_comment("keepalive")
+            continue
         if "error" in chunk:
             failed_response = build_response_object(
                 request,
@@ -461,6 +594,7 @@ async def generate_responses_stream(
                 previous_response_id=request.previous_response_id,
                 error={"message": chunk["error"], "type": "sdu_backend_error", "code": "sdu_backend_error"},
             )
+            debug_sse_event(response_id, "response.failed")
             yield response_failed_event(failed_response)
             break
 
@@ -469,6 +603,7 @@ async def generate_responses_stream(
         if reasoning_delta:
             reasoning += reasoning_delta
             if emit_reasoning_events:
+                debug_sse_event(response_id, "response.reasoning_summary_text.delta")
                 yield (
                     "event: response.reasoning_summary_text.delta\n"
                     f"data: {json.dumps({'type': 'response.reasoning_summary_text.delta', 'delta': reasoning_delta}, ensure_ascii=False)}\n\n"
@@ -477,6 +612,7 @@ async def generate_responses_stream(
             content += delta
             if stream_item is not None:
                 stream_item["content"][0]["text"] += delta
+                debug_sse_event(response_id, "response.output_text.delta")
                 yield message_delta_event(stream_item, delta)
 
     thread.join()
@@ -489,28 +625,52 @@ async def generate_responses_stream(
 
     if buffer_for_tools:
         output, tool_errors = build_output_items(content, reasoning, request)
-        debug_compat_event("stream_buffered_output", request, output, reasoning, tool_errors)
+        debug_compat_event("stream_buffered_output", request, output, reasoning, tool_errors, response_id=response_id)
+        if not output or output_text_is_empty(output):
+            failed_response = build_empty_output_failed_response(request, response_id, created_at, request.previous_response_id, tool_errors)
+            if tool_errors:
+                failed_response["compatibility_warnings"] = tool_errors
+            response_store.put(failed_response, prepared.conversation, prepared.input_items, persistent=request.store is not False)
+            debug_sse_event(response_id, "response.failed")
+            yield response_failed_event(failed_response)
+            return
         for output_index, item in enumerate(output):
             if item.get("type") in {"function_call", "custom_tool_call"}:
                 for event in tool_call_events(item, output_index):
+                    if "event: " in event:
+                        debug_sse_event(response_id, event.split("\n", 1)[0].replace("event: ", ""))
                     yield event
             else:
                 for event in message_start_events(item, output_index):
+                    if "event: " in event:
+                        debug_sse_event(response_id, event.split("\n", 1)[0].replace("event: ", ""))
                     yield event
                 text = item.get("content", [{}])[0].get("text", "")
                 if text:
+                    debug_sse_event(response_id, "response.output_text.delta")
                     yield message_delta_event(item, text, output_index)
                 for event in message_done_events(item, output_index):
+                    if "event: " in event:
+                        debug_sse_event(response_id, event.split("\n", 1)[0].replace("event: ", ""))
                     yield event
     else:
         output = [stream_item] if stream_item is not None else [message_output_item(content)]
         tool_errors = []
-        debug_compat_event("stream_text_output", request, output, reasoning, tool_errors)
+        debug_compat_event("stream_text_output", request, output, reasoning, tool_errors, response_id=response_id)
+        if not output or output_text_is_empty(output):
+            failed_response = build_empty_output_failed_response(request, response_id, created_at, request.previous_response_id, tool_errors)
+            response_store.put(failed_response, prepared.conversation, prepared.input_items, persistent=request.store is not False)
+            debug_sse_event(response_id, "response.failed")
+            yield response_failed_event(failed_response)
+            return
         if stream_item is not None:
             for event in message_done_events(stream_item):
+                if "event: " in event:
+                    debug_sse_event(response_id, event.split("\n", 1)[0].replace("event: ", ""))
                 yield event
 
     if reasoning and emit_reasoning_events:
+        debug_sse_event(response_id, "response.reasoning_summary_text.done")
         yield (
             "event: response.reasoning_summary_text.done\n"
             f"data: {json.dumps({'type': 'response.reasoning_summary_text.done', 'text': reasoning}, ensure_ascii=False)}\n\n"
@@ -528,7 +688,19 @@ async def generate_responses_stream(
         response["compatibility_warnings"] = tool_errors
     conversation = append_response_to_conversation(prepared.conversation, output)
     response_store.put(response, conversation, prepared.input_items, persistent=request.store is not False)
+    debug_request_event(
+        "stream_response_completed",
+        request,
+        response_id,
+        prepared,
+        {
+            "output_item_types": [item.get("type") for item in output],
+            "has_function_call": output_has_tool_call(output),
+            "output_text_empty": output_text_is_empty(output),
+        },
+    )
     update_stats(prompt_tokens, len(response.get("output_text", "")) + len(reasoning))
+    debug_sse_event(response_id, "response.completed")
     yield response_completed_event(response)
 
 

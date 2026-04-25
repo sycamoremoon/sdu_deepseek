@@ -11,6 +11,7 @@ from typing import Any
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 TOOL_CALL_TAG_RE = re.compile(r"</?tool_call>", re.IGNORECASE)
 TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>\s*", re.IGNORECASE)
+TOOL_PLAN_RE = re.compile(r"<tool_plan>\s*(?P<body>.*?)\s*</tool_plan>", re.DOTALL | re.IGNORECASE)
 CODE_FENCE_RE = re.compile(r"```(?:json|tool_call)?\s*(?P<body>\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 APPLY_PATCH_RE = re.compile(r"<apply_patch>\s*(?P<body>.*?)\s*</apply_patch>", re.DOTALL | re.IGNORECASE)
 TOOL_RECORD_RE = re.compile(
@@ -224,6 +225,15 @@ def _extract_tool_call_candidates(text: str, specs_by_name: dict[str, ToolSpec])
         if "</tool_call>" in text[match.end():]:
             continue
         candidates.append(_ToolCallCandidate(source="open_tool_call", span=span, payload=text[match.end():].strip()))
+    for match in TOOL_PLAN_RE.finditer(text):
+        candidates.append(
+            _ToolCallCandidate(
+                source="tool_plan",
+                span=match.span(),
+                payload=match.group("body").strip(),
+                name="update_plan",
+            )
+        )
     for match in CODE_FENCE_RE.finditer(text):
         candidates.append(_ToolCallCandidate(source="code_fence", span=match.span(), payload=match.group("body").strip()))
     for match in APPLY_PATCH_RE.finditer(text):
@@ -323,7 +333,7 @@ def _parse_candidate(
             return apply_patch_shell, None
         return None, "apply_patch tool was not declared."
 
-    if candidate.source in {"named_xml", "tool_record", "custom_tool_record", "self_closing_xml"}:
+    if candidate.source in {"named_xml", "tool_plan", "tool_record", "custom_tool_record", "self_closing_xml"}:
         if not candidate.name:
             return None, "Named tool call missing tool name."
         spec = specs_by_name.get(candidate.name)

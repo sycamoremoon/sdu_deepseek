@@ -159,7 +159,7 @@ class ChatStream:
 
 def chat(content, history, config):
     form_data = make_chat_request(content, history, config)
-    response = requests.post(url, data=form_data, cookies=cookies, stream=True)
+    response = requests.post(url, data=form_data, cookies=cookies, stream=True, timeout=(10, 660))
     
     if response.status_code != 200:
         print(f"[SDU API] Error: HTTP {response.status_code}")

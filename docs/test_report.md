@@ -9,7 +9,7 @@ Date: 2026-04-25
 | Working directory | `/Volumes/Hacking/SDU_DeepSeek` |
 | Python venv | temporary `.codex-venv` |
 | Python | `3.14` |
-| Codex CLI | `codex-cli 0.120.0` locally; user reproduction used `0.123.0` |
+| Codex CLI | `codex-cli 0.125.0` locally; user reproduction used `0.123.0` |
 
 Dependencies installed in a temporary local venv, then removed after testing:
 
@@ -31,7 +31,7 @@ SDU_DEEPSEEK_SKIP_LOGIN=1 .codex-venv/bin/pytest -q
 Result:
 
 ```text
-65 passed, 3 skipped in 1.34s
+73 passed, 3 skipped in 0.82s
 ```
 
 Coverage areas:
@@ -68,6 +68,10 @@ Coverage areas:
 | Think-model apply_patch custom-tool streaming buffer | Passed |
 | Think-model apply_patch fallback to declared `exec_command` | Passed |
 | V4 bare apply_patch fallback to declared `exec_command` | Passed |
+| V4 `<tool_plan>` compatibility mapped to declared `update_plan` | Passed |
+| V4 long multi-turn tool loop does not stop on intermediate tool calls | Passed |
+| Empty/filtered model output returns failed instead of empty completed | Passed |
+| Tool-loop raw code block work returns failed instead of final completed | Passed |
 | Unclosed custom-tool wrapper recovery | Passed |
 | Top-level function argument recovery | Passed |
 | Responses non-stream text route for V3.2, V3.2-think, V4 | Passed |
@@ -85,7 +89,7 @@ Coverage areas:
 Syntax check:
 
 ```bash
-.codex-venv/bin/python -m py_compile main.py responses_models.py responses_adapter.py responses_store.py tool_bridge.py streaming.py scripts/capture_codex_requests.py scripts/probe_sdu_capabilities.py examples/test_openai_responses_client.py
+python3 -m py_compile main.py responses_models.py responses_adapter.py responses_store.py tool_bridge.py streaming.py scripts/capture_codex_requests.py scripts/capture_codex_session.py scripts/probe_sdu_capabilities.py examples/test_openai_responses_client.py
 ```
 
 Result: passed.
@@ -114,7 +118,7 @@ Server command:
 .codex-venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 18083
 ```
 
-Current focused run used local Codex `0.120.0`, so it is a compatibility smoke rather than an exact reproduction of the user's `0.123.0` environment. The server loaded the existing `cookies.json`; no cookie values or credentials were printed.
+Current focused run used local Codex `0.125.0`, close to the user's `0.123.0` reproduction. The server loaded the existing `cookies.json`; no cookie values or credentials were printed.
 
 Think-model apply_patch run:
 
@@ -157,19 +161,24 @@ deepseek-ai/DeepSeek-V4: Codex executed exec_command pwd and returned the temp w
 
 No raw `<tool_call>`, `<apply_patch>`, or `<think>` markup appeared as the final assistant answer in these runs.
 
-V4 regression smoke for the reported prompt shape:
+V4 regression probe for the reported long prompt:
 
 ```bash
 env SDU_DEEPSEEK_API_KEY=dummy CODEX_HOME=/tmp/codex-sdu-v4-regression-home codex exec \
-  --ephemeral --skip-git-repo-check --sandbox workspace-write \
-  -C /tmp/sdu-codex-v4-regression-... \
-  -c 'model_providers.sdu_deepseek={name="SDU DeepSeek Local", base_url="http://127.0.0.1:18084/v1", env_key="SDU_DEEPSEEK_API_KEY", wire_api="responses", stream_idle_timeout_ms=300000}' \
+  --ignore-user-config --ephemeral --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \
+  -C /tmp/sdu-codex-v4-stop-... \
+  -c 'model_providers.sdu_deepseek={name="SDU DeepSeek Local", base_url="http://127.0.0.1:18086/v1", env_key="SDU_DEEPSEEK_API_KEY", wire_api="responses", stream_idle_timeout_ms=600000, stream_max_retries=5}' \
   -c model_provider="sdu_deepseek" \
   -m deepseek-ai/DeepSeek-V4 \
-  '帮我写一个python程序，关于文件整理的。请创建 file_organizer.py，代码可以简单但要能运行，然后读取文件确认。'
+  '帮我写一个python程序，关于文件整理的, 包括完整的测试用例和使用说明。实现细节随意不要向我提问'
 ```
 
-Result: Codex created `file_organizer.py`, then read it back with `cat`. It used declared shell/function tooling and did not expose raw `<apply_patch>` as the final assistant message.
+Result: the sanitized capture in `docs/codex_v4_stop_probe.md` shows Codex continued across 17 streamed `/v1/responses` requests. It sent `function_call_output` items after local tool execution and kept the full tool list on each request. The service returned 11 function-call responses (`exec_command` and `update_plan`) and no empty `completed` responses.
+
+The run reproduced two V4 model-output quirks:
+
+1. V4 emitted `<tool_plan>{...}</tool_plan>`; this is now parsed into the declared `update_plan` function call.
+2. V4 later emitted a raw Python code block plus a stray `</think>` while it was in an active tool loop. Because there was no safe filename/tool payload to infer, the service now returns `response.failed` for that pattern instead of a final `message`, preventing silent early completion. This is covered by `test_tool_loop_code_block_work_is_not_silent_completed`.
 
 Older baseline runs from the previous report also validated simple text, V3.2 `exec_command`, and V3.2 file creation/read loops; those commands used a Linux venv path and are superseded by the focused run above for this branch.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,7 @@ class PreparedResponsesRequest:
     history: list[AdapterMessage]
     conversation: list[dict[str, Any]]
     input_items: list[dict[str, Any]] = field(default_factory=list)
+    stored_conversation_hit: bool = False
 
     def to_sdu_history(self) -> list[sduwrap.ChatSession]:
         sessions: list[sduwrap.ChatSession] = []
@@ -44,6 +46,7 @@ class PreparedResponsesRequest:
 def prepare_responses_request(request: ResponsesRequest, store: ResponseStore) -> PreparedResponsesRequest:
     messages: list[AdapterMessage] = []
     input_items = normalize_input_items(request.input)
+    stored_conversation_hit = False
 
     if request.previous_response_id:
         stored = store.get(request.previous_response_id)
@@ -53,6 +56,7 @@ def prepare_responses_request(request: ResponsesRequest, store: ResponseStore) -
                 f"previous_response_id {request.previous_response_id} was not found in the in-memory store.",
                 "previous_response_id",
             )
+        stored_conversation_hit = True
         for item in stored.conversation:
             role = item.get("role")
             content = item.get("content")
@@ -107,6 +111,7 @@ def prepare_responses_request(request: ResponsesRequest, store: ResponseStore) -
         history=history,
         conversation=conversation,
         input_items=input_items,
+        stored_conversation_hit=stored_conversation_hit,
     )
 
 
@@ -325,8 +330,13 @@ def build_response_object(
 
 
 def normalize_sdu_output(content: str, reasoning_text: str = "") -> tuple[str, str]:
-    if "<think" not in content:
+    if "<think" not in content and "</think" not in content:
         return content, reasoning_text
+
+    if "<think" not in content and "</think" in content:
+        match = re.search(r"(?is)^(?P<hidden>.*?)</think\\?>", content)
+        if match:
+            return content[match.end():].lstrip(), reasoning_text + match.group("hidden")
 
     stream = sduwrap.ChatStream()
     visible, hidden = stream.process(content)
@@ -347,11 +357,53 @@ def build_output_items(content: str, reasoning_text: str, request: ResponsesRequ
     errors: list[str] = []
     if parse_result:
         errors = parse_result.errors
+        if parse_result.had_tool_markup and parse_result.errors:
+            return [], parse_result.errors
         if parse_result.stripped_text:
             message_text = parse_result.stripped_text
-        elif parse_result.had_tool_markup and parse_result.errors:
-            message_text = "The model returned a tool call that could not be converted safely."
+    if request.tools and _has_tool_output_input(request.input) and _looks_like_unconverted_tool_work(message_text):
+        return [], ["Model returned tool-work text during a tool loop instead of a declared tool call."]
     return [message_output_item(message_text)], errors
+
+
+def _has_tool_output_input(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get("type") in {"function_call_output", "custom_tool_call_output"}:
+            return True
+        return any(_has_tool_output_input(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_tool_output_input(item) for item in value)
+    return False
+
+
+def _looks_like_unconverted_tool_work(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if re.search(r"</?tool_[a-z_]+>", stripped, flags=re.IGNORECASE):
+        return True
+    if re.search(r"</?think\\?>", stripped, flags=re.IGNORECASE):
+        return True
+    if "```" not in stripped:
+        return False
+    work_phrases = (
+        "write",
+        "create",
+        "modify",
+        "implement",
+        "test",
+        "file",
+        "README",
+        "编写",
+        "创建",
+        "修改",
+        "实现",
+        "测试",
+        "文件",
+        "用例",
+        "说明",
+    )
+    return any(phrase in stripped for phrase in work_phrases)
 
 
 def message_output_item(text: str) -> dict[str, Any]:
