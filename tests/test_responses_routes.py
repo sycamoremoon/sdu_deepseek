@@ -244,6 +244,39 @@ def test_custom_tool_call_response_with_unclosed_wrapper(client, mock_sdu):
     assert "Add File: hello.py" in body["output"][0]["input"]
 
 
+def test_custom_tool_call_response_with_old_codex_function_like_apply_patch(client, mock_sdu):
+    mock_sdu(
+        [
+            {
+                "content": '<tool_call>\n<apply_patch>\n*** Begin Patch\n*** New File: file_organizer.py\n+print("hi")\n*** End Patch\n</apply_patch>\n</tool_call>',
+                "reasoning_content": "",
+            }
+        ]
+    )
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V3.2-think",
+            "input": "write file",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool.",
+                        "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
+                    },
+                }
+            ],
+        },
+    )
+    body = response.json()
+    assert response.status_code == 200
+    assert body["output"][0]["type"] == "custom_tool_call"
+    assert body["output"][0]["name"] == "apply_patch"
+    assert "New File: file_organizer.py" in body["output"][0]["input"]
+
+
 def test_function_tool_response_with_top_level_arguments(client, mock_sdu):
     mock_sdu(
         [
@@ -283,6 +316,43 @@ def test_function_tool_response_with_top_level_arguments(client, mock_sdu):
         "cmd": "python3 /home/test/test2/file_organizer.py --help",
         "workdir": "/home/test/test2",
     }
+
+
+def test_stream_think_then_tool_call_events(client, mock_sdu):
+    mock_sdu(
+        [
+            {
+                "content": '<think>先检查目录，再执行命令。</think><exec_command>{"cmd":"pwd"}</exec_command>',
+                "reasoning_content": "",
+            }
+        ]
+    )
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": "deepseek-ai/DeepSeek-V3.2-think",
+            "input": "need pwd",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                }
+            ],
+        },
+    ) as response:
+        text = response.read().decode("utf-8")
+    assert response.status_code == 200
+    assert "event: response.function_call_arguments.delta" in text
+    assert '"name":"exec_command"' in text
+    assert "<think>" not in text
+    assert "response.reasoning_summary_text.delta" not in text
 
 
 def test_stream_codex_named_xml_tool_call_events(client, mock_sdu):

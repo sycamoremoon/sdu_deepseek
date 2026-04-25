@@ -324,6 +324,20 @@ def build_response_object(
     return response
 
 
+def normalize_sdu_output(content: str, reasoning_text: str = "") -> tuple[str, str]:
+    if "<think" not in content:
+        return content, reasoning_text
+
+    stream = sduwrap.ChatStream()
+    visible, hidden = stream.process(content)
+    tail_visible, tail_hidden = stream.finalize()
+    normalized_content = visible + tail_visible
+    extracted_reasoning = hidden + tail_hidden
+    if extracted_reasoning:
+        return normalized_content, reasoning_text + extracted_reasoning
+    return content, reasoning_text
+
+
 def build_output_items(content: str, reasoning_text: str, request: ResponsesRequest) -> tuple[list[dict[str, Any]], list[str]]:
     parse_result = parse_tool_calls(content, request.tools, request.parallel_tool_calls) if request.tools else None
     if parse_result and parse_result.calls:

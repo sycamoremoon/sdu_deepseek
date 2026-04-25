@@ -83,6 +83,25 @@ def test_parse_custom_tool_call_named_xml_body():
     assert item["input"].startswith("*** Begin Patch")
 
 
+def test_parse_apply_patch_when_old_codex_sends_function_like_tool():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
+            },
+        }
+    ]
+    result = parse_tool_calls("<tool_call>\n<apply_patch>\n*** Begin Patch\n*** End Patch\n</apply_patch>\n</tool_call>", tools)
+    assert not result.errors
+    item = result.calls[0].to_response_item()
+    assert item["type"] == "custom_tool_call"
+    assert item["name"] == "apply_patch"
+    assert item["input"].startswith("*** Begin Patch")
+
+
 def test_parse_custom_tool_call_with_unclosed_wrapper_and_loose_input():
     tools = [{"type": "custom", "name": "apply_patch", "format": {"type": "grammar"}}]
     text = '<tool_call>{"name":"apply_patch","input":"*** Begin Patch\n*** Add File: hello.py\n+print("hi")\n*** End Patch\n"}]()}'

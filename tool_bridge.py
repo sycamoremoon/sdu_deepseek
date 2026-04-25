@@ -28,6 +28,7 @@ PREVIOUS_TOOL_RECORD_RE = re.compile(
     r"arguments_json:\s*(?P<arguments>\{.*?\})\s*(?=$|\n)",
     re.DOTALL,
 )
+KNOWN_FREEFORM_TOOL_NAMES = {"apply_patch"}
 
 
 @dataclass
@@ -92,6 +93,7 @@ def extract_tool_specs(raw_tools: list[Any] | None) -> list[ToolSpec]:
         if not isinstance(raw, dict):
             continue
         tool_type = str(raw.get("type") or "function")
+        format_info = raw.get("format") if isinstance(raw.get("format"), dict) else {}
         if tool_type == "function" and isinstance(raw.get("function"), dict):
             function = raw["function"]
             name = function.get("name")
@@ -103,12 +105,20 @@ def extract_tool_specs(raw_tools: list[Any] | None) -> list[ToolSpec]:
             parameters = raw.get("parameters") if isinstance(raw.get("parameters"), dict) else {}
         if not name:
             continue
+        normalized_name = str(name)
+        normalized_description = str(description)
+        inferred_custom = (
+            tool_type == "custom"
+            or normalized_name in KNOWN_FREEFORM_TOOL_NAMES
+            or format_info.get("type") == "grammar"
+            or "FREEFORM" in normalized_description.upper()
+        )
         specs.append(
             ToolSpec(
-                name=str(name),
-                description=str(description),
+                name=normalized_name,
+                description=normalized_description,
                 parameters=parameters,
-                type=tool_type,
+                type="custom" if inferred_custom else tool_type,
                 raw=raw,
             )
         )

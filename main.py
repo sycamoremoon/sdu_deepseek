@@ -17,6 +17,7 @@ from responses_adapter import (
     build_output_items,
     build_response_object,
     message_output_item,
+    normalize_sdu_output,
     prepare_responses_request,
 )
 from responses_models import ResponsesRequest, UnsupportedInputError, error_response
@@ -189,6 +190,7 @@ app.add_middleware(
 )
 
 MODEL_MAP = {
+    "deepseek-ai/DeepSeek-V4": "DeepSeek-V4",
     "deepseek-ai/DeepSeek-V3.2": "DeepSeek-V3.2",
     "deepseek-ai/DeepSeek-R1": "DeepSeek-R1",
     "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
@@ -198,6 +200,7 @@ MODEL_MAP = {
 }
 
 MODELS_DATA = [
+    {"id": "deepseek-ai/DeepSeek-V4", "owned_by": "deepseek-ai"},
     {"id": "deepseek-ai/DeepSeek-V3.2", "owned_by": "deepseek-ai"},
     {"id": "deepseek-ai/DeepSeek-R1", "owned_by": "deepseek-ai"},
     {"id": "deepseek-ai/DeepSeek-V3", "owned_by": "deepseek-ai"},
@@ -250,7 +253,16 @@ def collect_sdu_response(current_input: str, history, config: ChatConfig) -> tup
     for chunk in sduwrap.chat(current_input, history, config):
         full_content += chunk.get("content", "")
         full_reasoning += chunk.get("reasoning_content", "")
-    return full_content, full_reasoning
+    return normalize_sdu_output(full_content, full_reasoning)
+
+
+def should_stream_reasoning_events(request: ResponsesRequest) -> bool:
+    if os.environ.get("SDU_DEEPSEEK_STREAM_REASONING") == "1":
+        return True
+    include = request.include
+    if isinstance(include, list):
+        return any(isinstance(item, str) and "reason" in item.lower() for item in include)
+    return False
 
 
 def response_not_found(response_id: str) -> JSONResponse:
@@ -391,6 +403,7 @@ async def generate_responses_stream(
     reasoning = ""
     prompt_tokens = len(prepared.current_input) + sum(len(message.content) for message in prepared.history)
     buffer_for_tools = bool(request.tools)
+    emit_reasoning_events = should_stream_reasoning_events(request)
     stream_item = None
 
     if not buffer_for_tools:
@@ -420,10 +433,11 @@ async def generate_responses_stream(
         reasoning_delta = chunk.get("reasoning_content", "")
         if reasoning_delta:
             reasoning += reasoning_delta
-            yield (
-                "event: response.reasoning_summary_text.delta\n"
-                f"data: {json.dumps({'type': 'response.reasoning_summary_text.delta', 'delta': reasoning_delta}, ensure_ascii=False)}\n\n"
-            )
+            if emit_reasoning_events:
+                yield (
+                    "event: response.reasoning_summary_text.delta\n"
+                    f"data: {json.dumps({'type': 'response.reasoning_summary_text.delta', 'delta': reasoning_delta}, ensure_ascii=False)}\n\n"
+                )
         if delta:
             content += delta
             if stream_item is not None:
@@ -435,6 +449,8 @@ async def generate_responses_stream(
     if failed_response is not None:
         response_store.put(failed_response, prepared.conversation, prepared.input_items, persistent=request.store is not False)
         return
+
+    content, reasoning = normalize_sdu_output(content, reasoning)
 
     if buffer_for_tools:
         output, tool_errors = build_output_items(content, reasoning, request)
@@ -457,7 +473,7 @@ async def generate_responses_stream(
             for event in message_done_events(stream_item):
                 yield event
 
-    if reasoning:
+    if reasoning and emit_reasoning_events:
         yield (
             "event: response.reasoning_summary_text.done\n"
             f"data: {json.dumps({'type': 'response.reasoning_summary_text.done', 'text': reasoning}, ensure_ascii=False)}\n\n"
@@ -569,6 +585,7 @@ async def openai_chat_completion(request: ChatCompletionRequest):
                 
                 content = chunk.get("content", "")
                 reasoning = chunk.get("reasoning_content", "")
+                content, reasoning = normalize_sdu_output(content, reasoning)
                 completion_tokens += len(content) + len(reasoning)
                 
                 if reasoning:
@@ -646,6 +663,7 @@ async def openai_chat_completion(request: ChatCompletionRequest):
         for chunk in sduwrap.chat(current_input, request_history, config):
             full_content += chunk.get("content", "")
             full_reasoning += chunk.get("reasoning_content", "")
+        full_content, full_reasoning = normalize_sdu_output(full_content, full_reasoning)
         
         completion_tokens = len(full_content) + len(full_reasoning)
         update_stats(prompt_tokens, completion_tokens)
